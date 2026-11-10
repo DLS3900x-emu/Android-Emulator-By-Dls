@@ -1,3 +1,14 @@
+# v13
+
+- **Fixed "home screen install failed: cmd: Can't find service: package"**:
+  Aetheron thought Android had finished booting about two seconds after the
+  framework started (it trusted a log line that appears early when the boot
+  animation is off). It now asks Android itself and waits until the package
+  service answers before installing the home screen or running the clean-up
+  script. The boot screen also stays up until then.
+- The clean-up script runs once more on every installation, because v12
+  could run it too early and still mark it as done.
+
 # v12
 
 - **Aetheron home screen**: Aetheron's own launcher (`apps\AetheronLauncher.apk`,

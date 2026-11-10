@@ -13,6 +13,7 @@ class BootStageTracker {
 public:
     enum Channel { kSerial = 0, kLogcat = 1 };
     static constexpr int kRankSecondStage = 4;
+    static constexpr int kRankZygote = 5;
     static constexpr int kRankBootCompleted = 7;
 
     explicit BootStageTracker(std::function<void(const std::string&)> on_stage) : on_stage_(std::move(on_stage)) {}
@@ -46,8 +47,10 @@ private:
             {4, "init second stage started", "Android init (second stage)"},
             {5, "starting service 'zygote'", "Android framework starting (zygote)"},
             {6, "Entered the Android system server", "Android system server starting"},
-            {7, "sys.boot_completed=1", "Android boot completed"},
-            {7, "Boot is finished", "Android boot completed"},
+            // init runs this action when Android reports that boot is complete. (SurfaceFlinger's
+            // "Boot is finished" is not usable: with the boot animation off it appears seconds
+            // after zygote starts, long before the system services are up.)
+            {7, "processing action (sys.boot_completed=1", "Android boot completed"},
         };
         for (const auto& m : kMarkers) {
             if (m.rank > rank_ && l.find(m.text) != std::string::npos) {

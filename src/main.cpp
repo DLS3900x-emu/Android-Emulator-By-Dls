@@ -289,7 +289,7 @@ void RunGuestSetup() {
         return;
     }
     std::vector<std::string> lines;
-    uint32_t hash = 2166136261u;
+    uint32_t hash = 2166136261u ^ 2;  // bump to make every installation run the script once more
     std::istringstream ss(text);
     std::string line;
     while (std::getline(ss, line)) {
@@ -315,16 +315,23 @@ void RunGuestSetup() {
 }
 
 void ProvisionLauncher();
+bool WaitAndroidReady(int seconds);
 
 void TimerThread() {
     HANDLE t = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!t) t = CreateWaitableTimerW(nullptr, TRUE, nullptr);
     bool halt_seen = false, setup_sent = false;
     while (!g.quit) {
-        if (!setup_sent && g.stage->rank() >= BootStageTracker::kRankBootCompleted) {
+        if (!setup_sent && g.stage->rank() >= BootStageTracker::kRankZygote) {
             setup_sent = true;
-            // Home screen first, then the clean-up script (which ends on the home screen).
             std::thread([] {
+                // Ask Android itself when it is ready rather than trusting a log line.
+                if (!WaitAndroidReady(600)) return;
+                if (g.stage->rank() < BootStageTracker::kRankBootCompleted) {
+                    g.reveal = true;  // the log marker was missed; do not leave the boot screen up
+                    SetStatus("guest running: Android boot completed");
+                }
+                // Home screen first, then the clean-up script (which ends on the home screen).
                 ProvisionLauncher();
                 if (g.s.first_boot_setup) RunGuestSetup();
             }).detach();
@@ -684,6 +691,25 @@ struct AdbSession {
     }
 };
 
+// True once Android has finished booting and its package service answers.
+bool AndroidReady(AdbClient& adb) {
+    std::string out, err;
+    if (!adb.Shell("getprop sys.boot_completed; cmd package path android 2>&1", &out, &err)) return false;
+    return out.rfind("1", 0) == 0 && out.find("package:") != std::string::npos;
+}
+
+bool WaitAndroidReady(int seconds) {
+    for (int i = 0; i < seconds && !g.quit && g.vm.running(); ++i) {
+        // A fresh connection per try: adbd may not be up yet, or may restart during boot.
+        AdbSession s;
+        std::string err;
+        if (s.Open(0, &err) && AndroidReady(s.adb)) return true;
+        Sleep(1000);
+    }
+    Log("adb: Android did not finish booting within %d s", seconds);
+    return false;
+}
+
 // Streams an .apk to Android's package installer. `message` gets its answer.
 bool AdbInstall(AdbClient& adb, const std::wstring& file, std::string* message) {
     FILE* f = _wfopen(file.c_str(), L"rb");
@@ -749,6 +775,10 @@ void AdbTransfer(std::vector<std::wstring> files) {
             SetStatus("cannot install yet: " + err);
             return;
         }
+        if (!AndroidReady(s.adb)) {
+            SetStatus("Android is still starting - try again in a moment");
+            return;
+        }
         for (const std::wstring& file : files) {
             const std::string name = Narrow(file.substr(file.find_last_of(L"\\/") + 1));
             const bool apk = file.size() > 4 && _wcsicmp(file.c_str() + file.size() - 4, L".apk") == 0;
@@ -806,6 +836,14 @@ void ProvisionLauncher() {
     if (!s.Open(60, &err)) {
         Log("launcher: %s", err.c_str());
         SetStatus("home screen not installed: " + err);
+        return;
+    }
+    // The boot stage comes from log lines; ask Android itself before using its package service.
+    bool ready = false;
+    for (int i = 0; i < 300 && !g.quit && g.vm.running() && !(ready = AndroidReady(s.adb)); ++i) Sleep(1000);
+    if (!ready) {
+        Log("launcher: Android's package service did not become ready");
+        SetStatus("home screen not installed: Android's package service is not ready");
         return;
     }
     s.adb.Shell(std::string("[ -e ") + marker + " ] && pm path " + kLauncherPackage, &out, &err);
