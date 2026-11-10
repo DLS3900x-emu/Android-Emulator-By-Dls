@@ -1,3 +1,21 @@
+# v12
+
+- **Aetheron home screen**: Aetheron's own launcher (`apps\AetheronLauncher.apk`,
+  source in `launcher/`) is installed into Android after boot and made the
+  default home: dark background, clock, a search box and one grid with all
+  apps. Tap to open; long-press for App info / Uninstall. Switch it off with
+  `custom_launcher = off` (Settings -> Android), which also removes it.
+- **Built-in app install**: Aetheron now speaks Android's debug protocol
+  (adb) itself, over the virtual machine's vsock link. No `adb.exe`, no
+  download. Sidebar button *Install an app*, or drop files on the window:
+  `.apk` files are installed, other files go to Android's Download folder.
+- The clean-up script no longer switches off apps you installed yourself.
+
+Tested here: the adb client against a scripted adbd (harness), the launcher
+compiles and passes `apksigner verify`, clean Windows cross-build. **Not
+tested: the launcher running in Android, and installs on a real PC.** If the
+home screen misbehaves, set `custom_launcher = off` and restart Aetheron.
+
 # v11
 
 - **Game controls card**: the keyboard button in the sidebar opens a small

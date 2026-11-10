@@ -14,6 +14,9 @@
 #include "devices/virtio_net.h"
 #include "devices/virtio_vsock.h"
 #include "host/oemlock.h"
+#include "host/adb_client.h"
+#include <deque>
+#include <algorithm>
 #include "ui/keymapper.h"
 #include "boot/ramdisk_inspect.h"
 #include <memory>
@@ -259,6 +262,37 @@ int main(){
     km.enabled=false; CHECK(!km.OnKey('F',true,0,t));
     CHECK(KeyMapper::KeyName(0x70)=="F1" && KeyMapper::KeyFromName("f12")==0x7B && KeyMapper::KeyFromName(KeyMapper::KeyName(191))==191);
     printf("key mapping OK\n"); }
+  // ---- built-in adb client against a scripted adbd ----
+  { struct FakeAdbd : ByteStream {
+      enum : uint32_t { CNXN=0x4E584E43, AUTH=0x48545541, OPEN=0x4E45504F, OKAY=0x59414B4F, CLSE=0x45534C43, WRTE=0x45545257 };
+      std::vector<uint8_t> in; std::deque<uint8_t> out; bool auth=false; size_t expect=0; std::string received; int wrtes=0, okays=0, closes=0;
+      void Reply(uint32_t c,uint32_t a0,uint32_t a1,const std::string& d){ uint32_t s=0; for(unsigned char ch: d) s+=ch;
+        uint32_t h[6]={c,a0,a1,uint32_t(d.size()),s,c^0xffffffffu}; const uint8_t* p=(const uint8_t*)h; out.insert(out.end(),p,p+24); out.insert(out.end(),d.begin(),d.end()); }
+      bool Write(const uint8_t* d,size_t n) override { in.insert(in.end(),d,d+n);
+        while(in.size()>=24){ uint32_t h[6]; memcpy(h,in.data(),24); if(in.size()<24+h[3]) break;
+          std::string data(in.begin()+24,in.begin()+24+h[3]); uint32_t s=0; for(unsigned char ch: data) s+=ch;
+          if(h[5]!=(h[0]^0xffffffffu) || h[4]!=s) return false;                 // malformed packet from the client
+          in.erase(in.begin(),in.begin()+24+h[3]); Handle(h[0],h[1],h[2],data); }
+        return true; }
+      void Handle(uint32_t c,uint32_t a0,uint32_t,const std::string& data){ const uint32_t remote=77; const std::string inst="exec:cmd package install -r -S ";
+        if(c==CNXN){ if(auth) Reply(AUTH,1,0,std::string(20,'t')); else Reply(CNXN,0x01000001,4096,std::string("device::\0",9)); }
+        else if(c==OPEN){ std::string svc(data.c_str());
+          if(svc=="shell:echo hi"){ Reply(OKAY,remote,a0,""); Reply(OKAY,5,999,""); Reply(WRTE,remote,a0,"hi\n"); Reply(CLSE,remote,a0,""); }   // incl. a stray packet for another stream
+          else if(svc.rfind(inst,0)==0){ expect=size_t(atoi(svc.c_str()+inst.size())); Reply(OKAY,remote,a0,""); }
+          else Reply(CLSE,0,a0,""); }
+        else if(c==WRTE){ ++wrtes; received+=data; Reply(OKAY,remote,a0,""); if(received.size()==expect){ Reply(WRTE,remote,a0,"Success\n"); Reply(CLSE,remote,a0,""); } }
+        else if(c==OKAY) ++okays; else if(c==CLSE) ++closes; }
+      bool ReadExact(uint8_t* d,size_t n,int) override { if(out.size()<n) return false; for(size_t i=0;i<n;++i){ d[i]=out.front(); out.pop_front(); } return true; }
+    };
+    FakeAdbd dev; AdbClient adb(&dev); std::string out, e;
+    CHECK(adb.Connect(&e)); CHECK(adb.Shell("echo hi",&out,&e)); CHECK(out=="hi\n"); CHECK(dev.okays==1 && dev.closes==1);
+    std::string apk(10000,'\0'); for(size_t i=0;i<apk.size();++i) apk[i]=char(i*31+7);
+    size_t pos=0; out.clear();
+    CHECK(adb.Run("exec:cmd package install -r -S 10000",[&](uint8_t* b,size_t max){ size_t n=std::min(max,apk.size()-pos); memcpy(b,apk.data()+pos,n); pos+=n; return n; },&out,&e));
+    CHECK(out=="Success\n"); CHECK(dev.received==apk); CHECK(dev.wrtes==3);          // 4096-byte packets, as the device asked
+    out.clear(); CHECK(!adb.Run("shell:nope",nullptr,&out,&e)); CHECK(e.find("refused")!=std::string::npos);
+    FakeAdbd locked; locked.auth=true; AdbClient adb2(&locked); CHECK(!adb2.Connect(&e)); CHECK(e.find("authorisation")!=std::string::npos);
+    printf("adb client OK\n"); }
   // ---- all 30 PCI slots used by the emulator fit on the bus ----
   { Irq irq; PciBus bus(&irq); GuestMemory mem; CHECK(mem.Allocate(1<<20)); std::vector<std::unique_ptr<VirtioConsole>> cs;
     for (uint8_t s=1;s<=26;++s){ cs.emplace_back(new VirtioConsole(&mem, "")); bus.AddDevice(s, cs.back().get(), 16+(s%8)); }

@@ -8,3 +8,5 @@ tests/linux_harness/test
 tests/linux_harness/nettest
 tests/linux_harness/disk.bin
 tests/linux_harness/payload.bin
+launcher/build/
+screenshots/

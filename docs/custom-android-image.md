@@ -1,5 +1,11 @@
 # Building your own Android image for Aetheron
 
+**You may not need this.** Without building Android, Aetheron already changes
+the image you have after it boots: it installs its own home screen
+(`launcher/`, built with `launcher/build.sh`), hides unwanted built-in apps
+(`config\aetheron_setup.sh`) and installs any `.apk` you drop on the window.
+Building an image is only needed to change the system itself.
+
 BlueStacks looks clean out of the box because it ships an Android it built
 itself: its own launcher, wallpaper, boot animation and app set, plus Google
 apps under a licence from Google. Aetheron boots whatever image you give it,

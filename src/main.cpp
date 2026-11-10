@@ -7,6 +7,7 @@
 //   trace.log    - host-side VMM diagnostics
 #include <windows.h>
 #include <shellapi.h>
+#include <commdlg.h>
 #include <windowsx.h>
 
 #include <atomic>
@@ -39,7 +40,9 @@
 #include "devices/virtio_vsock.h"
 #include "disk/composite_disk.h"
 #include "disk/disk_config.h"
+#include "host/adb_client.h"
 #include "host/oemlock.h"
+#include "host/vsock_stream.h"
 #include "host/vsock_tcp_bridge.h"
 #include "ui/dx12_display.h"
 #include "ui/boot_stage.h"
@@ -100,6 +103,7 @@ struct Settings {
     bool network = true;
     bool boot_splash = true;
     bool first_boot_setup = true;
+    bool custom_launcher = true;
     bool adb_bridge = false;
     std::wstring setup_script = L"config\\aetheron_setup.sh";
     std::string cmdline_extra = "console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 8250.nr_uarts=1";
@@ -121,6 +125,7 @@ struct App {
     VirtioNet* net = nullptr;
     VirtioVsock* vsock = nullptr;
     std::unique_ptr<VsockTcpBridge> adb_bridge;
+    std::atomic<bool> adb_busy{false};
     std::unique_ptr<OemLockResponder> oemlock;
     std::unique_ptr<PortDevice> reset_ports;
     std::thread shutdown_thread;
@@ -234,6 +239,7 @@ void LoadSettings() {
         else if (k == "network") g.s.network = (v == "on" || v == "1" || v == "true");
         else if (k == "boot_splash") g.s.boot_splash = (v == "on" || v == "1" || v == "true");
         else if (k == "first_boot_setup") g.s.first_boot_setup = (v == "on" || v == "1" || v == "true");
+        else if (k == "custom_launcher") g.s.custom_launcher = (v == "on" || v == "1" || v == "true");
         else if (k == "setup_script") g.s.setup_script = Widen(v);
         else if (k == "adb_bridge") g.s.adb_bridge = (v == "on" || v == "1" || v == "true");
     }
@@ -308,6 +314,8 @@ void RunGuestSetup() {
     }
 }
 
+void ProvisionLauncher();
+
 void TimerThread() {
     HANDLE t = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!t) t = CreateWaitableTimerW(nullptr, TRUE, nullptr);
@@ -315,7 +323,11 @@ void TimerThread() {
     while (!g.quit) {
         if (!setup_sent && g.stage->rank() >= BootStageTracker::kRankBootCompleted) {
             setup_sent = true;
-            if (g.s.first_boot_setup) std::thread(RunGuestSetup).detach();
+            // Home screen first, then the clean-up script (which ends on the home screen).
+            std::thread([] {
+                ProvisionLauncher();
+                if (g.s.first_boot_setup) RunGuestSetup();
+            }).detach();
         }
         if (!halt_seen && g.stage->halted()) {
             halt_seen = true;
@@ -637,6 +649,190 @@ void RequestWipe(HWND hwnd) {
                 L"Aetheron", MB_OK | MB_ICONINFORMATION);
 }
 
+// ---- Windows -> Android channel: built-in adb client over virtio-vsock ----
+constexpr uint32_t kAdbdVsockPort = 5555;
+const char kLauncherPackage[] = "com.aetheron.launcher";
+
+std::string LastLine(const std::string& text) {
+    std::istringstream ss(text);
+    std::string line, last;
+    while (std::getline(ss, line)) {
+        line = Trim(line);
+        if (!line.empty()) last = line;
+    }
+    return last;
+}
+
+// One adb conversation with Android's debug service (adbd).
+struct AdbSession {
+    VsockStream stream;
+    AdbClient adb;
+    AdbSession() : stream(g.vsock), adb(&stream) {}
+
+    // Retries for `wait_seconds` while adbd is still starting.
+    bool Open(int wait_seconds, std::string* error) {
+        if (!g.vsock || !g.vm.running()) {
+            *error = "Android is not running";
+            return false;
+        }
+        for (int i = 0; i <= wait_seconds * 2 && !g.quit && g.vm.running(); ++i) {
+            if (stream.Connect(kAdbdVsockPort, 3000)) return adb.Connect(error);
+            Sleep(500);
+        }
+        *error = "Android's debug service (adbd) is not reachable";
+        return false;
+    }
+};
+
+// Streams an .apk to Android's package installer. `message` gets its answer.
+bool AdbInstall(AdbClient& adb, const std::wstring& file, std::string* message) {
+    FILE* f = _wfopen(file.c_str(), L"rb");
+    if (!f) {
+        *message = "cannot open the file";
+        return false;
+    }
+    _fseeki64(f, 0, SEEK_END);
+    const int64_t size = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+    std::string out, err;
+    const bool ran = adb.Run("exec:cmd package install -r -S " + std::to_string(size),
+                             [f](uint8_t* buf, size_t max) { return fread(buf, 1, max, f); }, &out, &err);
+    fclose(f);
+    *message = ran ? LastLine(out) : err;
+    return ran && out.find("Success") != std::string::npos;
+}
+
+// Copies any other file into Android's Download folder.
+bool AdbCopyToDownloads(AdbClient& adb, const std::wstring& file, std::string* message) {
+    FILE* f = _wfopen(file.c_str(), L"rb");
+    if (!f) {
+        *message = "cannot open the file";
+        return false;
+    }
+    _fseeki64(f, 0, SEEK_END);
+    const int64_t size = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+    // The name goes through Android's shell: keep only characters that are safe there.
+    std::string name;
+    for (wchar_t c : file.substr(file.find_last_of(L"\\/") + 1))
+        name.push_back((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') || c == L'.' ||
+                               c == L'-' || c == L'_'
+                           ? char(c)
+                           : '_');
+    if (name.empty() || name[0] == '.') name = "file" + name;
+    std::string out, err;
+    // head stops after exactly `size` bytes, so the stream needs no end marker.
+    const bool ran = adb.Run("exec:head -c " + std::to_string(size) + " > '/sdcard/Download/" + name +
+                                 "' && echo aetheron-copied",
+                             [f](uint8_t* buf, size_t max) { return fread(buf, 1, max, f); }, &out, &err);
+    fclose(f);
+    const bool ok = ran && out.find("aetheron-copied") != std::string::npos;
+    *message = ok ? name : ran ? LastLine(out) : err;
+    return ok;
+}
+
+// Installs .apk files and copies any other file into Android's Download
+// folder. Runs in the background; progress is shown in the top bar.
+void AdbTransfer(std::vector<std::wstring> files) {
+    if (files.empty()) return;
+    if (g.adb_busy.exchange(true)) {
+        SetStatus("still busy with the previous install or copy");
+        return;
+    }
+    std::thread([files] {
+        struct Done {
+            ~Done() { g.adb_busy = false; }
+        } done;
+        AdbSession s;
+        std::string err;
+        if (!s.Open(5, &err)) {
+            SetStatus("cannot install yet: " + err);
+            return;
+        }
+        for (const std::wstring& file : files) {
+            const std::string name = Narrow(file.substr(file.find_last_of(L"\\/") + 1));
+            const bool apk = file.size() > 4 && _wcsicmp(file.c_str() + file.size() - 4, L".apk") == 0;
+            SetStatus((apk ? "installing " : "copying ") + name + " ...");
+            std::string msg;
+            const bool ok = apk ? AdbInstall(s.adb, file, &msg) : AdbCopyToDownloads(s.adb, file, &msg);
+            Log("adb: %s %s: %s (%s)", apk ? "install" : "copy", name.c_str(), ok ? "ok" : "FAILED", msg.c_str());
+            if (!ok) {
+                SetStatus((apk ? "install failed: " : "copy failed: ") + name + " - " + msg);
+                return;
+            }
+            SetStatus(apk ? "installed " + name : "copied to Android's Download folder as " + msg);
+        }
+    }).detach();
+}
+
+void PickAndInstall(HWND hwnd) {
+    wchar_t buf[2048] = L"";
+    OPENFILENAMEW o = {};
+    o.lStructSize = sizeof(o);
+    o.hwndOwner = hwnd;
+    o.lpstrFilter = L"Android apps (*.apk)\0*.apk\0All files\0*.*\0";
+    o.lpstrFile = buf;
+    o.nMaxFile = 2048;
+    o.lpstrTitle = L"Install an app or copy a file into Android";
+    o.Flags = OFN_FILEMUSTEXIST | OFN_EXPLORER | OFN_HIDEREADONLY;
+    if (GetOpenFileNameW(&o)) AdbTransfer({buf});
+}
+
+// Puts Aetheron's own home screen (apps\AetheronLauncher.apk) into Android
+// and makes it the default; with custom_launcher = off, takes it out again.
+// A marker file named after the apk's contents makes each build install once.
+void ProvisionLauncher() {
+    AdbSession s;
+    std::string err, out;
+    if (!g.s.custom_launcher) {
+        if (!s.Open(30, &err)) return;
+        s.adb.Shell(std::string("pm path ") + kLauncherPackage + " > /dev/null 2>&1 && pm uninstall " + kLauncherPackage,
+                    &out, &err);
+        if (out.find("Success") != std::string::npos) Log("launcher: removed (custom_launcher = off)");
+        return;
+    }
+    const std::wstring apk = g.s.base_dir + L"\\apps\\AetheronLauncher.apk";
+    FILE* f = _wfopen(apk.c_str(), L"rb");
+    if (!f) {
+        Log("launcher: %ls not found, keeping Android's own home screen", apk.c_str());
+        return;
+    }
+    uint32_t hash = 2166136261u;
+    for (int c; (c = fgetc(f)) != EOF;) hash = (hash ^ uint8_t(c)) * 16777619u;
+    fclose(f);
+    char marker[80];
+    snprintf(marker, sizeof(marker), "/data/local/tmp/.aetheron_launcher_%08x", hash);
+
+    if (!s.Open(60, &err)) {
+        Log("launcher: %s", err.c_str());
+        SetStatus("home screen not installed: " + err);
+        return;
+    }
+    s.adb.Shell(std::string("[ -e ") + marker + " ] && pm path " + kLauncherPackage, &out, &err);
+    if (out.find("package:") != std::string::npos) return;  // this build is already in place
+
+    SetStatus("installing the Aetheron home screen...");
+    std::string msg;
+    bool ok = AdbInstall(s.adb, apk, &msg);
+    if (!ok && msg.find("INSTALL_FAILED_UPDATE_INCOMPATIBLE") != std::string::npos) {
+        // An older build signed with another key: replace it.
+        out.clear();
+        s.adb.Shell(std::string("pm uninstall ") + kLauncherPackage, &out, &err);
+        ok = AdbInstall(s.adb, apk, &msg);
+    }
+    if (!ok) {
+        Log("launcher: install failed: %s", msg.c_str());
+        SetStatus("home screen install failed: " + msg);
+        return;
+    }
+    out.clear();
+    s.adb.Shell(std::string("cmd package set-home-activity ") + kLauncherPackage + "/.HomeActivity; touch " + marker +
+                    "; am start -a android.intent.action.MAIN -c android.intent.category.HOME",
+                &out, &err);
+    Log("launcher: installed and set as home (%s)", LastLine(out).c_str());
+    SetStatus("Aetheron home screen installed");
+}
+
 // ---- touch and key mapping ----
 enum Capture { kCapNone = 0, kCapKey };
 // What a click in the controls editor hit: an item index, a swipe's end dot, or the joystick.
@@ -730,6 +926,7 @@ bool SaveSettingsToIni(const UiSettings& u) {
         {"network", u.network ? "on" : "off"},
         {"boot_splash", u.boot_splash ? "on" : "off"},
         {"first_boot_setup", u.first_boot_setup ? "on" : "off"},
+        {"custom_launcher", u.custom_launcher ? "on" : "off"},
     };
     const std::wstring path = g.s.base_dir + L"\\aetheron.ini";
     std::string text;
@@ -1119,6 +1316,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             break;
+        case WM_DROPFILES: {
+            HDROP drop = HDROP(wp);
+            std::vector<std::wstring> files;
+            const UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+            for (UINT i = 0; i < n; ++i) {
+                wchar_t path[1024];
+                if (DragQueryFileW(drop, i, path, 1024)) files.push_back(path);
+            }
+            DragFinish(drop);
+            AdbTransfer(files);
+            return 0;
+        }
         case WM_APP_LAYOUT:
             g.view_w = uint32_t(wp);
             g.view_h = uint32_t(lp);
@@ -1262,6 +1471,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case kUiHome: TapKey(172); return 0;     // KEY_HOMEPAGE
                 case kUiRecents: TapKey(580); return 0;  // KEY_APPSELECT
                 case kUiFullscreen: ToggleFullscreen(); return 0;
+                case kUiInstallApk: PickAndInstall(hwnd); return 0;
                 case kUiScreenshot: SaveScreenshot(); return 0;
                 case kUiSettings: ToggleSettings(); return 0;
                 case kUiSaveSettings:
@@ -1316,6 +1526,7 @@ LRESULT CALLBACK ViewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MOUSEMOVE:
         case WM_LBUTTONUP:
         case WM_RBUTTONDOWN:
+        case WM_DROPFILES:
             return WndProc(hwnd, msg, wp, lp);
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -1382,6 +1593,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g.pending.network = g.s.network;
     g.pending.boot_splash = g.s.boot_splash;
     g.pending.first_boot_setup = g.s.first_boot_setup;
+    g.pending.custom_launcher = g.s.custom_launcher;
     SetWindowPos(g.hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
     ShowWindow(g.hwnd, SW_SHOW);
     g.console.Create(inst, [](const std::string& line) {
@@ -1398,6 +1610,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g.view = CreateWindowExW(0, vc.lpszClassName, L"", WS_CHILD | WS_VISIBLE, 0, 0, 16, 16, g.hwnd, nullptr, inst, nullptr);
     if (!g.view) return 1;
     LayoutView();
+    DragAcceptFiles(g.hwnd, TRUE);
+    DragAcceptFiles(g.view, TRUE);
     g.display.SetLayoutNotify(g.hwnd, WM_APP_LAYOUT);
     UpdateSplash("starting");
     if (!g.display.Initialize(g.view, g.s.width, g.s.height, &err)) {

@@ -24,7 +24,7 @@ constexpr COLORREF kTrackOff = RGB(58, 60, 66), kKnobOff = RGB(170, 174, 182);
 enum Icon {
     kGlyphMenu, kGlyphSettings, kGlyphBack, kGlyphHome, kGlyphRecents, kGlyphFullscreen, kGlyphCamera,
     kGlyphConsole, kGlyphFolder, kGlyphLogs, kGlyphKeyboard, kGlyphMinimize, kGlyphMaximize, kGlyphRestore,
-    kGlyphClose, kGlyphPrev, kGlyphNext, kIconTap, kIconRepeat, kIconDpad, kIconSwipe
+    kGlyphClose, kGlyphPrev, kGlyphNext, kIconTap, kIconRepeat, kIconDpad, kIconSwipe, kIconInstall
 };
 
 const wchar_t* const kPages[] = {L"Performance", L"Display", L"Network", L"Android", L"Tools", L"About"};
@@ -186,6 +186,11 @@ void DrawIcon(HDC dc, const RECT& r, int icon, COLORREF color, float size = 17.0
             dot(3.2f, 8, 1.9f);
             line(6.5f, 8, 13.5f, 8);
             poly({10.5f, 5, 13.5f, 8, 10.5f, 11}, false);
+            break;
+        case kIconInstall:  // arrow into a tray
+            line(8, 2, 8, 9.5f);
+            poly({4.5f, 6.5f, 8, 10, 11.5f, 6.5f}, false);
+            poly({2.5f, 11, 2.5f, 13.5f, 13.5f, 13.5f, 13.5f, 11}, false);
             break;
     }
 }
@@ -420,6 +425,8 @@ void ShellUi::DrawBars(HDC dc, const RECT& client) {
     };
     side_btn(10, kGlyphFullscreen, L"Full screen (F11)", kUiFullscreen);
     side_btn(15, kGlyphKeyboard, L"Game controls: play with the keyboard", kUiControls);
+    side_btn(16, kIconInstall, L"Install an app (.apk) or copy a file into Android - or drop it on the window",
+             kUiInstallApk);
     side_btn(11, kGlyphCamera, L"Save a screenshot", kUiScreenshot);
     side_btn(12, kGlyphConsole, L"Android console", kUiShowConsole);
     side_btn(13, kGlyphLogs, L"Collect logs into a zip", kUiCollectLogs);
@@ -569,6 +576,8 @@ void ShellUi::DrawSettings(HDC dc, const RECT& area) {
             toggle(L"Internet access (built-in NAT)", edit_.network, [this] { edit_.network = !edit_.network; });
             break;
         case 3:
+            toggle(L"Aetheron home screen", edit_.custom_launcher,
+                   [this] { edit_.custom_launcher = !edit_.custom_launcher; });
             toggle(L"Run the clean-up script after boot", edit_.first_boot_setup,
                    [this] { edit_.first_boot_setup = !edit_.first_boot_setup; });
             info(L"Clean-up script", L"config\\aetheron_setup.sh hides unwanted apps and applies the dark theme. "
@@ -580,6 +589,7 @@ void ShellUi::DrawSettings(HDC dc, const RECT& area) {
             button(L"Android console (serial)", L"Open", kUiShowConsole, row_h, ctl_w);
             button(L"Collect logs into a zip", L"Collect", kUiCollectLogs, row_h, ctl_w);
             button(L"Aetheron folder", L"Open", kUiOpenFolder, row_h, ctl_w);
+            button(L"Install an app (.apk) / copy a file", L"Choose file...", kUiInstallApk, row_h, ctl_w);
             break;
         default:
             saved_page = false;

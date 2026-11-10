@@ -3,12 +3,12 @@
 # Turn it off with first_boot_setup = off in aetheron.ini. To undo everything,
 # use Aetheron menu -> Factory reset.
 
-# Apps that keep their icon on the home screen. Everything else that has an
-# icon is switched off (not deleted): `pm enable <package>` brings one back.
+# Built-in apps that keep their icon on the home screen. Every other built-in
+# app with an icon is switched off (not deleted; apps you install are left alone): `pm enable <package>` brings one back.
 # com.android.vending is the Play Store; it only exists if your Android image
 # ships Google apps. com.android.documentsui is the file picker other apps use.
 KEEP="com.android.settings com.android.vending com.android.documentsui"
-for p in $(cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER 2>/dev/null | grep / | cut -d/ -f1 | sort -u); do case " $KEEP " in *" $p "*) ;; *) pm disable-user --user 0 $p;; esac; done
+for p in $(cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER 2>/dev/null | grep / | cut -d/ -f1 | sort -u); do case " $KEEP " in *" $p "*) ;; *) case "$(pm path $p 2>/dev/null)" in package:/data/*) ;; *) pm disable-user --user 0 $p;; esac;; esac; done
 
 # Look and feel: dark theme, quicker animations, no lock screen, screen stays on.
 cmd uimode night yes

@@ -37,6 +37,7 @@ enum UiCmd : UINT {
     kUiEdDrop,      // HIWORD(wParam): EditorControl; lParam: client point, or -1 for "centre of the screen"
     kUiEdDone,
     kUiEdClear,
+    kUiInstallApk,
 };
 
 // What can be dragged out of the controls editor.
@@ -47,10 +48,11 @@ struct UiSettings {
     uint64_t ram_mb = 4096;
     uint32_t cpus = 1;
     uint32_t width = 1280, height = 720, dpi = 160;
-    bool network = true, boot_splash = true, first_boot_setup = true;
+    bool network = true, boot_splash = true, first_boot_setup = true, custom_launcher = true;
     bool operator==(const UiSettings& o) const {
         return ram_mb == o.ram_mb && cpus == o.cpus && width == o.width && height == o.height && dpi == o.dpi &&
-               network == o.network && boot_splash == o.boot_splash && first_boot_setup == o.first_boot_setup;
+               network == o.network && boot_splash == o.boot_splash && first_boot_setup == o.first_boot_setup &&
+               custom_launcher == o.custom_launcher;
     }
 };
 
