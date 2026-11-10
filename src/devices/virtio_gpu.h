@@ -41,6 +41,7 @@ private:
     uint32_t width_, height_;
     std::map<uint32_t, Resource> resources_;
     uint32_t scanout_resource_ = 0;
+    uint32_t scan_x_ = 0, scan_y_ = 0, scan_w_ = 0, scan_h_ = 0;  // visible rectangle of that resource
 };
 
 }  // namespace Aetheron

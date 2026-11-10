@@ -78,6 +78,8 @@ public:
 
     void SetStatus(const std::wstring& text);
     void SetEditor(bool open);
+    // The recent-apps screen is part of Android's stock home; without it the buttons would do nothing.
+    void SetRecentsVisible(bool visible) { recents_ = visible; }
     bool editor_open() const { return editor_open_; }
 
     void OpenSettings(const UiSettings& current);
@@ -110,6 +112,7 @@ private:
 
     HWND hwnd_ = nullptr;
     bool bars_ = true;
+    bool recents_ = true;
     std::vector<Hot> hots_;
     int hover_ = -1, pressed_ = -1;
     int drag_control_ = -1;  // EditorControl being dragged out of the editor

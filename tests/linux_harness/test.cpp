@@ -12,6 +12,7 @@
 #include "devices/ioapic.h"
 #include "common/host_clock.h"
 #include "devices/virtio_net.h"
+#include "devices/virtio_gpu.h"
 #include "devices/virtio_vsock.h"
 #include "host/oemlock.h"
 #include "host/adb_client.h"
@@ -293,6 +294,34 @@ int main(){
     out.clear(); CHECK(!adb.Run("shell:nope",nullptr,&out,&e)); CHECK(e.find("refused")!=std::string::npos);
     FakeAdbd locked; locked.auth=true; AdbClient adb2(&locked); CHECK(!adb2.Connect(&e)); CHECK(e.find("authorisation")!=std::string::npos);
     printf("adb client OK\n"); }
+  // ---- virtio-gpu: only the scanout rectangle is shown (framebuffers are padded) ----
+  { GuestMemory mem; CHECK(mem.Allocate(16<<20)); Irq irq; ScanoutBuffer so; VirtioGpu gpu(&mem,&so,8,4); gpu.SetIrq(&irq,21); gpu.ConfigWrite(4,2,0x6);
+    auto W=[&](uint64_t o,uint8_t s,uint64_t v){gpu.BarWrite(o,s,v);};
+    W(0x14,1,1); W(0x14,1,3); W(0x08,4,0); W(0x0C,4,0); W(0x08,4,1); W(0x0C,4,1); W(0x14,1,0xB);
+    auto setq=[&](int q,uint64_t base){ W(0x16,2,q); W(0x18,2,8); W(0x20,4,base); W(0x24,4,0); W(0x28,4,base+0x1000); W(0x2C,4,0); W(0x30,4,base+0x2000); W(0x34,4,0); W(0x1C,2,1); };
+    setq(0,0x10000); setq(1,0x20000); W(0x14,1,0xF);
+    uint16_t n=0;
+    auto cmd=[&](std::initializer_list<uint32_t> words){ std::vector<uint32_t> c(words); c.resize(16,0);
+      mem.Write(0x40000,c.data(),64);
+      uint8_t d0[16]={}, d1[16]={}; uint64_t a0=0x40000,a1=0x41000; uint32_t l=64; uint16_t f0=1,next=1,f1=2;
+      memcpy(d0,&a0,8); memcpy(d0+8,&l,4); memcpy(d0+12,&f0,2); memcpy(d0+14,&next,2); memcpy(d1,&a1,8); memcpy(d1+8,&l,4); memcpy(d1+12,&f1,2);
+      mem.Write(0x10000,d0,16); mem.Write(0x10000+16,d1,16);
+      uint16_t head=0; mem.Write(0x10000+0x1000+4+2*(n%8),&head,2); uint16_t idx=++n; mem.Write(0x10000+0x1000+2,&idx,2); W(0x3000,2,0);
+      uint32_t resp; mem.Read(0x41000,&resp,4); return resp; };
+    const uint32_t OK=0x1100;
+    uint8_t px[8*6*4]; for(int y=0;y<6;++y) for(int x=0;x<8;++x){ uint8_t* p=px+(y*8+x)*4; p[0]=uint8_t(x); p[1]=uint8_t(y); p[2]=0x40; p[3]=0xFF; }
+    mem.Write(0x60000,px,sizeof(px));
+    CHECK(cmd({0x0101,0,0,0,0,0, 5,1,8,6})==OK);                      // create resource 5: BGRA 8x6 (6 rows, 4 visible)
+    CHECK(cmd({0x0106,0,0,0,0,0, 5,1, 0x60000,0,sizeof(px),0})==OK);  // attach backing
+    CHECK(cmd({0x0105,0,0,0,0,0, 0,0,8,6, 0,0, 5,0})==OK);            // transfer everything
+    CHECK(cmd({0x0103,0,0,0,0,0, 0,0,8,4, 0,5})==OK);                 // scanout shows 8x4
+    CHECK(so.enabled && so.width==8 && so.height==4 && so.bgra.size()==32);
+    CHECK(so.bgra[0]==0xFF400000u && so.bgra[3*8+7]==0xFF400307u);
+    uint64_t f=so.frame; CHECK(cmd({0x0104,0,0,0,0,0, 0,4,8,2, 5,0})==OK); CHECK(so.frame==f);   // flush of the hidden rows only
+    px[(2*8+3)*4+2]=0x99; mem.Write(0x60000,px,sizeof(px));
+    CHECK(cmd({0x0105,0,0,0,0,0, 0,0,8,6, 0,0, 5,0})==OK); CHECK(cmd({0x0104,0,0,0,0,0, 2,1,4,5, 5,0})==OK);
+    CHECK(so.frame==f+1 && so.bgra[2*8+3]==0xFF990203u && so.height==4);
+    printf("virtio-gpu scanout rectangle OK\n"); }
   // ---- all 30 PCI slots used by the emulator fit on the bus ----
   { Irq irq; PciBus bus(&irq); GuestMemory mem; CHECK(mem.Allocate(1<<20)); std::vector<std::unique_ptr<VirtioConsole>> cs;
     for (uint8_t s=1;s<=26;++s){ cs.emplace_back(new VirtioConsole(&mem, "")); bus.AddDevice(s, cs.back().get(), 16+(s%8)); }

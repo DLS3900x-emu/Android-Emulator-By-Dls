@@ -1,3 +1,19 @@
+# v14
+
+- **No more black strip under the Android screen.** Android's framebuffer is
+  padded (1280x768 for a 1280x720 screen) and Aetheron showed the padding.
+  It now shows only the real screen area. This also fixes clicks landing a
+  little too low, because the padding was counted in touch positions.
+- **Android's taskbar is gone while the Aetheron home screen is used.** The
+  bar with the app-drawer icon and the three navigation buttons belongs to
+  Android's stock home app, which is now switched off (and switched back on
+  by `custom_launcher = off`). Back and Home are in Aetheron's top bar and
+  sidebar. The "Recent apps" buttons are hidden in this mode, because the
+  recent-apps screen is part of the stock home app.
+- **Gray home screen** (neutral gray instead of near-black).
+
+Not tested on a real PC. Boot time is unchanged.
+
 # v13
 
 - **Fixed "home screen install failed: cmd: Can't find service: package"**:

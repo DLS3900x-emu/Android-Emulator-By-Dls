@@ -402,8 +402,10 @@ void ShellUi::DrawBars(HDC dc, const RECT& client) {
     x += nav_w;
     IconButton(dc, RECT{x, 0, x + nav_w, kTopH}, 2, kGlyphHome, L"Home", kUiHome);
     x += nav_w;
-    IconButton(dc, RECT{x, 0, x + nav_w, kTopH}, 3, kGlyphRecents, L"Recent apps", kUiRecents);
-    x += nav_w;
+    if (recents_) {
+        IconButton(dc, RECT{x, 0, x + nav_w, kTopH}, 3, kGlyphRecents, L"Recent apps", kUiRecents);
+        x += nav_w;
+    }
 
     const int win_w = 46;
     int rx = cw - 4 * win_w;
@@ -432,13 +434,13 @@ void ShellUi::DrawBars(HDC dc, const RECT& client) {
     side_btn(13, kGlyphLogs, L"Collect logs into a zip", kUiCollectLogs);
     side_btn(14, kGlyphFolder, L"Open the Aetheron folder", kUiOpenFolder);
     // Bottom group, only if the window is tall enough not to overlap the top group.
-    const int bottom_top = ch - 4 - 4 * bh;
+    const int bottom_top = ch - 4 - (recents_ ? 4 : 3) * bh;
     if (bottom_top >= y + 8) {
         y = bottom_top;
         side_btn(20, kGlyphSettings, L"Settings", kUiSettings);
         side_btn(21, kGlyphBack, L"Back", kUiBack);
         side_btn(22, kGlyphHome, L"Home", kUiHome);
-        side_btn(23, kGlyphRecents, L"Recent apps", kUiRecents);
+        if (recents_) side_btn(23, kGlyphRecents, L"Recent apps", kUiRecents);
     }
 
     // ---- status / hint text in the free part of the top bar ----

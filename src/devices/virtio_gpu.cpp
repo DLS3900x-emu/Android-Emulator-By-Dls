@@ -118,22 +118,32 @@ void VirtioGpu::FlushToScanout(uint32_t res_id, uint32_t x, uint32_t y, uint32_t
     const Resource& r = it->second;
     int bo, go, ro;
     if (!FormatOffsets(r.format, &bo, &go, &ro)) return;
+    // The visible part is the rectangle given with SET_SCANOUT. The guest's
+    // framebuffer can be larger (rows/columns added for alignment), and that
+    // padding must not be shown or counted for touch coordinates.
+    const uint32_t sx = scan_x_ < r.width ? scan_x_ : 0, sy = scan_y_ < r.height ? scan_y_ : 0;
+    const uint32_t sw = scan_w_ && scan_w_ <= r.width - sx ? scan_w_ : r.width - sx;
+    const uint32_t sh = scan_h_ && scan_h_ <= r.height - sy ? scan_h_ : r.height - sy;
+    if (!sw || !sh) return;
     std::lock_guard<std::mutex> lock(scanout_->mutex);
-    if (scanout_->width != r.width || scanout_->height != r.height) {
-        scanout_->width = r.width;
-        scanout_->height = r.height;
-        scanout_->bgra.assign(size_t(r.width) * r.height, 0xFF000000u);
-        x = y = 0;
-        w = r.width;
-        h = r.height;
+    if (scanout_->width != sw || scanout_->height != sh) {
+        scanout_->width = sw;
+        scanout_->height = sh;
+        scanout_->bgra.assign(size_t(sw) * sh, 0xFF000000u);
+        x = sx;
+        y = sy;
+        w = sw;
+        h = sh;
     }
-    if (x >= r.width || y >= r.height) return;
-    if (x + w > r.width) w = r.width - x;
-    if (y + h > r.height) h = r.height - y;
-    for (uint32_t row = y; row < y + h; ++row) {
-        const uint8_t* src = r.pixels.data() + (size_t(row) * r.width + x) * 4;
-        uint32_t* dst = scanout_->bgra.data() + size_t(row) * r.width + x;
-        for (uint32_t i = 0; i < w; ++i, src += 4)
+    // Intersect the flushed rectangle with the visible one.
+    const uint64_t x0 = x > sx ? x : sx, y0 = y > sy ? y : sy;
+    const uint64_t x1 = uint64_t(x) + w < uint64_t(sx) + sw ? uint64_t(x) + w : uint64_t(sx) + sw;
+    const uint64_t y1 = uint64_t(y) + h < uint64_t(sy) + sh ? uint64_t(y) + h : uint64_t(sy) + sh;
+    if (x0 >= x1 || y0 >= y1) return;
+    for (uint64_t row = y0; row < y1; ++row) {
+        const uint8_t* src = r.pixels.data() + (size_t(row) * r.width + x0) * 4;
+        uint32_t* dst = scanout_->bgra.data() + size_t(row - sy) * sw + (x0 - sx);
+        for (uint64_t i = 0; i < x1 - x0; ++i, src += 4)
             dst[i] = 0xFF000000u | (uint32_t(src[ro]) << 16) | (uint32_t(src[go]) << 8) | src[bo];
     }
     scanout_->enabled = true;
@@ -199,6 +209,10 @@ void VirtioGpu::ProcessControl(const VirtqChain& c, uint32_t* written) {
                 rtype = kRespErrInvalidResource;
             } else {
                 scanout_resource_ = id;
+                scan_x_ = U32(cmd, 24);
+                scan_y_ = U32(cmd, 28);
+                scan_w_ = U32(cmd, 32);
+                scan_h_ = U32(cmd, 36);
                 auto& r = resources_[id];
                 FlushToScanout(id, 0, 0, r.width, r.height);
             }

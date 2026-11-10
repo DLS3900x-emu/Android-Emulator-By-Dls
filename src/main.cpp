@@ -659,6 +659,9 @@ void RequestWipe(HWND hwnd) {
 // ---- Windows -> Android channel: built-in adb client over virtio-vsock ----
 constexpr uint32_t kAdbdVsockPort = 5555;
 const char kLauncherPackage[] = "com.aetheron.launcher";
+// Android's stock home app. On tablet-sized screens it also draws the taskbar
+// with the navigation buttons; Aetheron's top bar and sidebar replace those.
+const char kStockLauncher[] = "com.android.launcher3";
 
 std::string LastLine(const std::string& text) {
     std::istringstream ss(text);
@@ -816,7 +819,9 @@ void ProvisionLauncher() {
     std::string err, out;
     if (!g.s.custom_launcher) {
         if (!s.Open(30, &err)) return;
-        s.adb.Shell(std::string("pm path ") + kLauncherPackage + " > /dev/null 2>&1 && pm uninstall " + kLauncherPackage,
+        // Give Android its own home (and taskbar) back before taking ours away.
+        s.adb.Shell(std::string("pm enable ") + kStockLauncher + "; pm path " + kLauncherPackage +
+                        " > /dev/null 2>&1 && pm uninstall " + kLauncherPackage,
                     &out, &err);
         if (out.find("Success") != std::string::npos) Log("launcher: removed (custom_launcher = off)");
         return;
@@ -846,8 +851,19 @@ void ProvisionLauncher() {
         SetStatus("home screen not installed: Android's package service is not ready");
         return;
     }
+    // Switches the stock home off, but only while ours is installed, so there is always a home screen.
+    auto hide_stock = [&] {
+        std::string o, e;
+        s.adb.Shell(std::string("pm path ") + kLauncherPackage + " > /dev/null 2>&1 && pm disable-user --user 0 " +
+                        kStockLauncher,
+                    &o, &e);
+        Log("launcher: stock home and taskbar: %s", LastLine(o).c_str());
+    };
     s.adb.Shell(std::string("[ -e ") + marker + " ] && pm path " + kLauncherPackage, &out, &err);
-    if (out.find("package:") != std::string::npos) return;  // this build is already in place
+    if (out.find("package:") != std::string::npos) {  // this build is already in place
+        hide_stock();
+        return;
+    }
 
     SetStatus("installing the Aetheron home screen...");
     std::string msg;
@@ -868,6 +884,7 @@ void ProvisionLauncher() {
                     "; am start -a android.intent.action.MAIN -c android.intent.category.HOME",
                 &out, &err);
     Log("launcher: installed and set as home (%s)", LastLine(out).c_str());
+    hide_stock();
     SetStatus("Aetheron home screen installed");
 }
 
@@ -1621,6 +1638,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                              nullptr, inst, nullptr);
     if (!g.hwnd) return 1;
     g.ui.Attach(g.hwnd);
+    g.ui.SetRecentsVisible(!g.s.custom_launcher);
     g.controls_popup.Create(inst, g.hwnd);
     LoadKeymap();
     g.pending.ram_mb = g.s.ram_mb;

@@ -46,8 +46,9 @@ import java.util.Locale;
  * "App info" and "Uninstall". There are no pages, widgets or dock on purpose.
  */
 public class HomeActivity extends Activity {
-    private static final int BACKGROUND_TOP = 0xFF1B1C20, BACKGROUND_BOTTOM = 0xFF0D0D0F;
-    private static final int TEXT = 0xFFECEEF2, DIM = 0xFF9A9EA6, FIELD = 0xFF2A2B31, HIGHLIGHT = 0x26FFFFFF;
+    // Neutral gray, no colour tint.
+    private static final int BACKGROUND_TOP = 0xFF3C3C3E, BACKGROUND_BOTTOM = 0xFF323234;
+    private static final int TEXT = 0xFFF2F2F2, DIM = 0xFFB4B4B6, FIELD = 0xFF4C4C4F, HIGHLIGHT = 0x26FFFFFF;
 
     private static final class App {
         ComponentName component;
