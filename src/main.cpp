@@ -43,6 +43,7 @@
 #include "host/vsock_tcp_bridge.h"
 #include "ui/dx12_display.h"
 #include "ui/boot_stage.h"
+#include "ui/controls_ui.h"
 #include "ui/gdiplus_util.h"
 #include "ui/keymap.h"
 #include "ui/keymapper.h"
@@ -132,8 +133,15 @@ struct App {
     KeyMapper keymap;
     bool touch_active[KeyMapper::kSlots] = {};  // fingers currently down on the guest touch screen
     int touch_next_id = 1;
-    int capture = 0;                            // Capture: what the next click / key press is for
-    float capture_x = 0, capture_y = 0;
+    ControlsPopup controls_popup;               // the "Game controls" card
+    bool popup_was_open = false;                // at the last mouse press on the main window
+    bool editor = false;                        // controls editor: clicks on the screen edit, they do not touch
+    int capture = 0;                            // Capture: what the next key press is for
+    int cap_item = -1;
+    bool cap_new = false;                       // the item waiting for its key was just dropped
+    bool ed_dragging = false, ed_moved = false;
+    int ed_target = -1;
+    POINT ed_down = {0, 0};
     UiSettings pending;  // what the settings page shows (saved values)
     HMENU popup = nullptr;
     bool fullscreen = false;
@@ -630,7 +638,10 @@ void RequestWipe(HWND hwnd) {
 }
 
 // ---- touch and key mapping ----
-enum Capture { kCapNone = 0, kCapTapSpot, kCapTapKey, kCapDpadSpot };
+enum Capture { kCapNone = 0, kCapKey };
+// What a click in the controls editor hit: an item index, a swipe's end dot, or the joystick.
+constexpr int kNoTarget = -1, kDpadTarget = -2, kEndTargetBase = 1000;
+constexpr UINT_PTR kKeymapTimer = 78;
 
 // One finger on the guest touch screen (Linux multi-touch protocol B).
 // x and y are fractions of the screen; down on a held slot moves the finger.
@@ -670,8 +681,8 @@ void SendTouch(HWND hwnd, int x, int y, bool, bool down) {
     TouchSlot(KeyMapper::kMouseSlot, down, float(x) / rc.right, float(y) / rc.bottom);
 }
 
-// Shows the key mapping in the settings page and as hints on the Android
-// screen; with `save`, also writes config\aetheron_keymap.txt.
+// Shows the key mapping as hints on the Android screen and in the game-controls
+// card; with `save`, also writes config\\aetheron_keymap.txt.
 void PublishKeymap(bool save) {
     if (save) {
         const std::string text = g.keymap.Serialize();
@@ -681,26 +692,23 @@ void PublishKeymap(bool save) {
             fclose(f);
         }
     }
-    UiControls c;
-    c.enabled = g.keymap.enabled;
-    c.hints = g.keymap.hints;
-    c.dpad = g.keymap.dpad.enabled;
     std::vector<OverlayMarker> markers;
-    for (const KeyMapper::Tap& t : g.keymap.taps) {
-        const std::wstring name = Widen(KeyMapper::KeyName(t.vk));
-        c.taps.push_back(name + L"   presses the spot at " + std::to_wstring(int(t.x * 100 + 0.5f)) + L"%, " +
-                         std::to_wstring(int(t.y * 100 + 0.5f)) + L"%");
-        markers.push_back({t.x, t.y, 0.036f, name});
+    if (g.editor || (g.keymap.enabled && g.keymap.hints)) {
+        for (const KeyMapper::Item& it : g.keymap.items) {
+            std::wstring name = it.vk ? Widen(KeyMapper::KeyName(it.vk)) : L"?";
+            if (it.type == KeyMapper::kRepeat) name += L" \u00D7";
+            markers.push_back({it.x, it.y, 0.036f, name});
+            if (it.type == KeyMapper::kSwipe) markers.push_back({it.x2, it.y2, 0.016f, L""});
+        }
+        if (g.keymap.dpad.enabled) {
+            const KeyMapper::Dpad& d = g.keymap.dpad;
+            markers.push_back({d.x, d.y, d.radius,
+                               Widen(KeyMapper::KeyName(d.up) + " " + KeyMapper::KeyName(d.left) + " " +
+                                     KeyMapper::KeyName(d.down) + " " + KeyMapper::KeyName(d.right))});
+        }
     }
-    if (g.keymap.dpad.enabled) {
-        const KeyMapper::Dpad& d = g.keymap.dpad;
-        markers.push_back({d.x, d.y, d.radius,
-                           Widen(KeyMapper::KeyName(d.up) + " " + KeyMapper::KeyName(d.left) + " " +
-                                 KeyMapper::KeyName(d.down) + " " + KeyMapper::KeyName(d.right))});
-    }
-    if (!g.keymap.enabled || !g.keymap.hints) markers.clear();
-    g.ui.SetControls(c);
-    g.display.SetOverlay(std::move(markers));
+    g.controls_popup.SetState(g.keymap.enabled, g.keymap.hints, g.keymap.opacity);
+    g.display.SetOverlay(std::move(markers), g.editor ? 1.0f : g.keymap.opacity);
 }
 
 void LoadKeymap() {
@@ -802,8 +810,10 @@ void TapKey(uint16_t code) {
 }
 
 void LayoutView();
+void SetEditor(bool on);
 
 void ToggleFullscreen() {
+    if (!g.fullscreen) SetEditor(false);  // the editor panel is part of the bars that full screen hides
     const LONG_PTR style = GetWindowLongPtrW(g.hwnd, GWL_STYLE);
     if (!g.fullscreen) {
         g.saved_placement.length = sizeof(g.saved_placement);
@@ -826,18 +836,172 @@ void ToggleFullscreen() {
     LayoutView();
 }
 
-// The next click on the Android screen (and, for a key, the next key press)
-// defines a mapping instead of going to Android.
-void BeginCapture(int what, const char* prompt) {
-    void ToggleSettings();
-    if (g.ui.settings_open()) ToggleSettings();
+// ---- controls editor ----
+// Which control is under a point of the Android screen (fractions of it).
+int HitMarker(float nx, float ny) {
+    const float a = g.keymap.aspect;
+    auto near_pt = [&](float x, float y, float r) {
+        const float dx = (nx - x) * a, dy = ny - y;
+        return dx * dx + dy * dy <= r * r;
+    };
+    for (int i = int(g.keymap.items.size()) - 1; i >= 0; --i) {
+        const KeyMapper::Item& it = g.keymap.items[size_t(i)];
+        if (near_pt(it.x, it.y, 0.05f)) return i;
+        if (it.type == KeyMapper::kSwipe && near_pt(it.x2, it.y2, 0.035f)) return kEndTargetBase + i;
+    }
+    const KeyMapper::Dpad& d = g.keymap.dpad;
+    if (d.enabled && near_pt(d.x, d.y, d.radius)) return kDpadTarget;
+    return kNoTarget;
+}
+
+void MoveTarget(int target, float nx, float ny) {
+    nx = nx < 0 ? 0 : nx > 1 ? 1 : nx;
+    ny = ny < 0 ? 0 : ny > 1 ? 1 : ny;
+    if (target == kDpadTarget) {
+        g.keymap.dpad.x = nx;
+        g.keymap.dpad.y = ny;
+    } else if (target >= kEndTargetBase && size_t(target - kEndTargetBase) < g.keymap.items.size()) {
+        g.keymap.items[size_t(target - kEndTargetBase)].x2 = nx;
+        g.keymap.items[size_t(target - kEndTargetBase)].y2 = ny;
+    } else if (target >= 0 && size_t(target) < g.keymap.items.size()) {
+        KeyMapper::Item& it = g.keymap.items[size_t(target)];
+        // A swipe keeps its direction when its start is moved.
+        it.x2 += nx - it.x;
+        it.y2 += ny - it.y;
+        it.x2 = it.x2 < 0 ? 0 : it.x2 > 1 ? 1 : it.x2;
+        it.y2 = it.y2 < 0 ? 0 : it.y2 > 1 ? 1 : it.y2;
+        it.x = nx;
+        it.y = ny;
+    }
+}
+
+// Controls that never got a key do nothing; drop them.
+void DropUnassigned() {
+    auto& items = g.keymap.items;
+    for (int i = int(items.size()) - 1; i >= 0; --i)
+        if (!items[size_t(i)].vk) items.erase(items.begin() + i);
+    g.capture = kCapNone;
+    g.cap_item = -1;
+}
+
+void SetEditor(bool on) {
+    if (on == g.editor) return;
+    g.controls_popup.Hide();
     g.keymap.ReleaseAll(TouchSlot);
-    g.capture = what;
-    SetStatus(prompt);
+    if (on && g.ui.settings_open()) {
+        g.ui.CloseSettings();
+        ShowWindow(g.view, SW_SHOW);
+    }
+    if (g.ed_dragging) {
+        g.ed_dragging = false;
+        ReleaseCapture();
+    }
+    DropUnassigned();
+    g.editor = on;
+    g.ui.SetEditor(on);
+    LayoutView();
+    PublishKeymap(!on);
+    SetStatus(on ? "controls editor: drag a control from the panel onto the screen" : "controls saved");
+}
+
+// A control was dragged out of the editor panel and released at `lp` (client
+// point of the main window), or clicked (`lp` = -1: put it in the middle).
+void EditorDrop(int control, LPARAM lp) {
+    if (!g.editor) return;
+    float nx = 0.5f, ny = 0.5f;
+    if (lp != LPARAM(-1)) {
+        POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ClientToScreen(g.hwnd, &p);
+        ScreenToClient(g.view, &p);
+        RECT rc;
+        GetClientRect(g.view, &rc);
+        if (rc.right <= 0 || rc.bottom <= 0 || p.x < 0 || p.y < 0 || p.x >= rc.right || p.y >= rc.bottom) {
+            SetStatus("drop the control on the Android screen");
+            return;
+        }
+        nx = float(p.x) / rc.right;
+        ny = float(p.y) / rc.bottom;
+    }
+    DropUnassigned();
+    if (control == kEdDpad) {
+        g.keymap.dpad.x = nx;
+        g.keymap.dpad.y = ny;
+        g.keymap.dpad.enabled = true;
+        // Its four keys now belong to the joystick.
+        auto& items = g.keymap.items;
+        const KeyMapper::Dpad& d = g.keymap.dpad;
+        for (int i = int(items.size()) - 1; i >= 0; --i) {
+            const uint32_t vk = items[size_t(i)].vk;
+            if (vk == d.up || vk == d.left || vk == d.down || vk == d.right) items.erase(items.begin() + i);
+        }
+        PublishKeymap(true);
+        SetStatus("joystick placed: W A S D drag a finger around that spot");
+        return;
+    }
+    const KeyMapper::Type type = control == kEdRepeat ? KeyMapper::kRepeat
+                                 : control == kEdSwipe ? KeyMapper::kSwipe
+                                                       : KeyMapper::kTap;
+    g.cap_item = g.keymap.AddItem(type, nx, ny);
+    g.cap_new = true;
+    g.capture = kCapKey;
+    SetFocus(g.hwnd);
+    PublishKeymap(false);
+    SetStatus("now press the key for this control (Esc cancels)");
+}
+
+void EditorRemove(int target) {
+    if (target == kDpadTarget) {
+        g.keymap.dpad.enabled = false;
+    } else {
+        const int i = target >= kEndTargetBase ? target - kEndTargetBase : target;
+        if (i < 0 || size_t(i) >= g.keymap.items.size()) return;
+        g.keymap.items.erase(g.keymap.items.begin() + i);
+    }
+    g.capture = kCapNone;
+    g.cap_item = -1;
+    PublishKeymap(true);
+    SetStatus("control removed");
+}
+
+// A key press while the editor waits for a control's key.
+void EditorKey(uint32_t vk) {
+    if (vk == VK_ESCAPE) {
+        if (g.cap_new && g.cap_item >= 0 && size_t(g.cap_item) < g.keymap.items.size())
+            g.keymap.items.erase(g.keymap.items.begin() + g.cap_item);
+        g.capture = kCapNone;
+        g.cap_item = -1;
+        PublishKeymap(true);
+        SetStatus("cancelled");
+        return;
+    }
+    if (vk == VK_F11) return;
+    const int index = g.keymap.AssignKey(g.cap_item, vk);
+    if (index < 0) {
+        SetStatus(KeyMapper::KeyName(vk) + " belongs to the joystick - press another key");
+        return;
+    }
+    const bool swipe = g.keymap.items[size_t(index)].type == KeyMapper::kSwipe;
+    g.capture = kCapNone;
+    g.cap_item = -1;
+    PublishKeymap(true);
+    SetStatus(KeyMapper::KeyName(vk) + (swipe && g.cap_new ? " set - drag the small dot to where the swipe should end"
+                                                           : " set for this control"));
+}
+
+void ToggleControlsPopup() {
+    if (g.popup_was_open) {  // the click that reached us already closed it
+        g.popup_was_open = false;
+        return;
+    }
+    const RECT b = g.ui.controls_button();
+    POINT p = {b.left - 8, b.top};
+    ClientToScreen(g.hwnd, &p);
+    g.controls_popup.Show(p.x, p.y);
 }
 
 // Opens or closes the settings page; the Android screen is hidden meanwhile.
 void ToggleSettings() {
+    if (g.editor) SetEditor(false);
     if (g.ui.settings_open()) g.ui.CloseSettings();
     else g.ui.OpenSettings(g.pending);
     ShowWindow(g.view, g.ui.settings_open() ? SW_HIDE : SW_SHOW);
@@ -897,9 +1061,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g.ui.Tick();
                     return 0;
                 }
+                if (wp == kKeymapTimer) {
+                    g.keymap.Tick(GetTickCount64(), TouchSlot);
+                    if (!g.keymap.needs_tick()) KillTimer(hwnd, kKeymapTimer);
+                    return 0;
+                }
                 break;
             case WM_KILLFOCUS:
                 g.keymap.ReleaseAll(TouchSlot);  // no stuck fingers when the window loses the keyboard
+                g.controls_popup.Hide();
                 break;
             case WM_PAINT: {
                 PAINTSTRUCT ps;
@@ -920,9 +1090,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g.ui.MouseLeave();
                 return 0;
             case WM_LBUTTONDOWN:
+                g.popup_was_open = g.controls_popup.visible();
+                g.controls_popup.Hide();
                 SetCapture(hwnd);
                 g.ui.MouseDown(pt);
                 return 0;
+            case WM_MOVE:
+                g.controls_popup.Hide();  // it is positioned in screen coordinates
+                break;
             case WM_LBUTTONUP:
                 ReleaseCapture();
                 g.ui.MouseUp(pt);
@@ -939,6 +1114,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_SIZE:
             if (hwnd == g.hwnd) {
+                g.controls_popup.Hide();
                 LayoutView();
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
@@ -950,23 +1126,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_LBUTTONDOWN:
             if (hwnd != g.view) return 0;  // the bars around the screen are not part of it
-            if (g.capture == kCapTapSpot || g.capture == kCapDpadSpot) {
+            g.controls_popup.Hide();
+            if (g.editor) {
                 RECT rc;
                 GetClientRect(hwnd, &rc);
                 if (rc.right <= 0 || rc.bottom <= 0) return 0;
-                const float nx = float(GET_X_LPARAM(lp)) / rc.right, ny = float(GET_Y_LPARAM(lp)) / rc.bottom;
-                if (g.capture == kCapTapSpot) {
-                    g.capture_x = nx;
-                    g.capture_y = ny;
-                    g.capture = kCapTapKey;
-                    SetStatus("now press the key for that spot (Esc cancels)");
-                } else {
-                    g.keymap.dpad.x = nx;
-                    g.keymap.dpad.y = ny;
-                    g.keymap.dpad.enabled = true;
-                    g.capture = kCapNone;
-                    PublishKeymap(true);
-                    SetStatus("joystick placed - W A S D now drag a finger around that spot");
+                SetFocus(g.hwnd);
+                g.ed_down = POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                g.ed_target = HitMarker(float(g.ed_down.x) / rc.right, float(g.ed_down.y) / rc.bottom);
+                g.ed_moved = false;
+                if (g.ed_target != kNoTarget) {
+                    g.ed_dragging = true;
+                    SetCapture(hwnd);
                 }
                 return 0;
             }
@@ -975,9 +1146,46 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendTouch(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), true, true);
             return 0;
         case WM_MOUSEMOVE:
+            if (g.ed_dragging) {
+                const int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+                if (!g.ed_moved && abs(x - g.ed_down.x) + abs(y - g.ed_down.y) < 5) return 0;  // still a click
+                g.ed_moved = true;
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+                if (rc.right <= 0 || rc.bottom <= 0) return 0;
+                MoveTarget(g.ed_target, float(x) / rc.right, float(y) / rc.bottom);
+                PublishKeymap(false);
+                return 0;
+            }
             if (g.touching) SendTouch(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), false, true);
             return 0;
+        case WM_RBUTTONDOWN:
+            if (hwnd == g.view && g.editor && !g.ed_dragging) {
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+                if (rc.right > 0 && rc.bottom > 0) {
+                    const int target = HitMarker(float(GET_X_LPARAM(lp)) / rc.right, float(GET_Y_LPARAM(lp)) / rc.bottom);
+                    if (target != kNoTarget) EditorRemove(target);
+                }
+                return 0;
+            }
+            break;
         case WM_LBUTTONUP:
+            if (g.ed_dragging) {
+                g.ed_dragging = false;
+                ReleaseCapture();
+                if (g.ed_moved) {
+                    PublishKeymap(true);
+                } else if (g.ed_target == kDpadTarget) {
+                    SetStatus("the joystick uses W A S D - drag it to move it, right-click to remove it");
+                } else if (g.ed_target >= 0 && g.ed_target < kEndTargetBase) {
+                    g.cap_item = g.ed_target;
+                    g.cap_new = false;
+                    g.capture = kCapKey;
+                    SetStatus("press the new key for this control (Esc cancels)");
+                }
+                return 0;
+            }
             if (g.touching) {
                 g.touching = false;
                 ReleaseCapture();
@@ -995,19 +1203,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g.ui.settings_open()) break;  // typing must not reach Android behind the settings page
             {
                 const bool key_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-                if (g.capture != kCapNone) {
-                    if (key_down && wp == VK_ESCAPE) {
-                        g.capture = kCapNone;
-                        SetStatus("key mapping cancelled");
-                    } else if (key_down && g.capture == kCapTapKey) {
-                        g.keymap.SetTap(uint32_t(wp), g.capture_x, g.capture_y);
-                        g.capture = kCapNone;
-                        PublishKeymap(true);
-                        SetStatus(KeyMapper::KeyName(uint32_t(wp)) + " now presses that spot");
-                    }
+                if (g.editor) {  // while editing, keys configure controls and never reach Android
+                    if (key_down && !(lp & (1 << 30)) && g.capture == kCapKey) EditorKey(uint32_t(wp));
                     return 0;
                 }
-                if (g.keymap.OnKey(uint32_t(wp), key_down, TouchSlot)) return 0;  // mapped keys act as fingers
+                if (g.keymap.OnKey(uint32_t(wp), key_down, GetTickCount64(), TouchSlot)) {
+                    // Mapped keys act as fingers; repeated taps and swipes are advanced by a timer.
+                    if (g.keymap.needs_tick()) SetTimer(g.hwnd, kKeymapTimer, 15, nullptr);
+                    return 0;
+                }
             }
             if (!g.keyboard) break;
             bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
@@ -1019,18 +1223,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_COMMAND:
-            if (LOWORD(wp) >= kUiKmRemove && LOWORD(wp) < kUiKmRemove + 100) {
-                const size_t i = LOWORD(wp) - kUiKmRemove;
-                g.keymap.ReleaseAll(TouchSlot);
-                if (i < g.keymap.taps.size()) g.keymap.taps.erase(g.keymap.taps.begin() + i);
-                PublishKeymap(true);
-                return 0;
-            }
             switch (LOWORD(wp)) {
-                case kUiControls:
-                    g.ui.OpenSettings(g.pending, ShellUi::kPageControls);
-                    ShowWindow(g.view, SW_HIDE);
-                    return 0;
+                case kUiControls: ToggleControlsPopup(); return 0;
                 case kUiKmEnable:
                     g.keymap.ReleaseAll(TouchSlot);
                     g.keymap.enabled = !g.keymap.enabled;
@@ -1040,17 +1234,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g.keymap.hints = !g.keymap.hints;
                     PublishKeymap(true);
                     return 0;
-                case kUiKmDpad:
-                    g.keymap.ReleaseAll(TouchSlot);
-                    g.keymap.dpad.enabled = !g.keymap.dpad.enabled;
+                case kUiKmOpacity: {
+                    const float v = float(lp) / 100.0f;
+                    g.keymap.opacity = v < 0.2f ? 0.2f : v > 1 ? 1 : v;
                     PublishKeymap(true);
                     return 0;
-                case kUiKmPlaceDpad:
-                    BeginCapture(kCapDpadSpot, "click the spot on the Android screen where the game's joystick is");
+                }
+                case kUiKmEditor: SetEditor(true); return 0;
+                case kUiEdDone: SetEditor(false); return 0;
+                case kUiEdClear:
+                    g.keymap.ReleaseAll(TouchSlot);
+                    g.keymap.items.clear();
+                    g.keymap.dpad.enabled = false;
+                    g.capture = kCapNone;
+                    g.cap_item = -1;
+                    PublishKeymap(true);
+                    SetStatus("all controls removed");
                     return 0;
-                case kUiKmAdd:
-                    BeginCapture(kCapTapSpot, "click the spot on the Android screen that the key should press");
-                    return 0;
+                case kUiEdDrop: EditorDrop(HIWORD(wp), lp); return 0;
                 case kCmdCollectLogs: CollectLogs(hwnd); return 0;
                 case kCmdShowConsole: g.console.Show(); return 0;
                 case kCmdOpenFolder:
@@ -1114,6 +1315,7 @@ LRESULT CALLBACK ViewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return WndProc(hwnd, msg, wp, lp);
         case WM_MOUSEMOVE:
         case WM_LBUTTONUP:
+        case WM_RBUTTONDOWN:
             return WndProc(hwnd, msg, wp, lp);
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -1170,6 +1372,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                              nullptr, inst, nullptr);
     if (!g.hwnd) return 1;
     g.ui.Attach(g.hwnd);
+    g.controls_popup.Create(inst, g.hwnd);
     LoadKeymap();
     g.pending.ram_mb = g.s.ram_mb;
     g.pending.cpus = g.s.cpus;

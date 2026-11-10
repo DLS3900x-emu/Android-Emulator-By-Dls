@@ -24,10 +24,10 @@ constexpr COLORREF kTrackOff = RGB(58, 60, 66), kKnobOff = RGB(170, 174, 182);
 enum Icon {
     kGlyphMenu, kGlyphSettings, kGlyphBack, kGlyphHome, kGlyphRecents, kGlyphFullscreen, kGlyphCamera,
     kGlyphConsole, kGlyphFolder, kGlyphLogs, kGlyphKeyboard, kGlyphMinimize, kGlyphMaximize, kGlyphRestore,
-    kGlyphClose, kGlyphPrev, kGlyphNext
+    kGlyphClose, kGlyphPrev, kGlyphNext, kIconTap, kIconRepeat, kIconDpad, kIconSwipe
 };
 
-const wchar_t* const kPages[] = {L"Performance", L"Display", L"Controls", L"Network", L"Android", L"Tools", L"About"};
+const wchar_t* const kPages[] = {L"Performance", L"Display", L"Network", L"Android", L"Tools", L"About"};
 
 struct Resolution {
     uint32_t w, h;
@@ -51,15 +51,17 @@ COLORREF Mix(COLORREF a, COLORREF b, float t) {
     return RGB(ch(GetRValue(a), GetRValue(b)), ch(GetGValue(a), GetGValue(b)), ch(GetBValue(a), GetBValue(b)));
 }
 
+constexpr int kEditorTileKey = 400;
+
 RECT Inset(const RECT& r, int dx, int dy) { return RECT{r.left + dx, r.top + dy, r.right - dx, r.bottom - dy}; }
 
 // Draws `icon` centred in `r` on a 16-unit grid.
-void DrawIcon(HDC dc, const RECT& r, int icon, COLORREF color) {
+void DrawIcon(HDC dc, const RECT& r, int icon, COLORREF color, float size = 17.0f) {
     using namespace Gdiplus;
     Graphics g(dc);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     g.SetPixelOffsetMode(PixelOffsetModeHalf);
-    const float size = 17.0f, u = size / 16.0f;
+    const float u = size / 16.0f;
     const float ox = (r.left + r.right) / 2.0f - size / 2, oy = (r.top + r.bottom) / 2.0f - size / 2;
     Pen pen(GdipColor(color), 1.5f);
     pen.SetStartCap(LineCapRound);
@@ -164,6 +166,27 @@ void DrawIcon(HDC dc, const RECT& r, int icon, COLORREF color) {
         case kGlyphNext:
             poly({6.5f, 4, 10.5f, 8, 6.5f, 12}, false);
             break;
+        case kIconTap:
+            ring(8, 8, 5.5f);
+            dot(8, 8, 1.8f);
+            break;
+        case kIconRepeat:
+            ring(8, 8, 6.5f);
+            ring(8, 8, 3.4f);
+            dot(8, 8, 1.0f);
+            break;
+        case kIconDpad:
+            ring(8, 8, 6.8f);
+            dot(8, 3.8f, 1.1f);
+            dot(8, 12.2f, 1.1f);
+            dot(3.8f, 8, 1.1f);
+            dot(12.2f, 8, 1.1f);
+            break;
+        case kIconSwipe:
+            dot(3.2f, 8, 1.9f);
+            line(6.5f, 8, 13.5f, 8);
+            poly({10.5f, 5, 13.5f, 8, 10.5f, 11}, false);
+            break;
     }
 }
 
@@ -188,6 +211,7 @@ RECT ShellUi::ContentRect() const {
     if (bars_) {
         rc.top += kTopH;
         rc.right -= kSideW;
+        if (editor_open_) rc.right -= kEditorW;
     }
     if (rc.right < rc.left) rc.right = rc.left;
     if (rc.bottom < rc.top) rc.bottom = rc.top;
@@ -199,14 +223,14 @@ void ShellUi::SetStatus(const std::wstring& text) {
     Redraw();
 }
 
-void ShellUi::SetControls(const UiControls& c) {
-    controls_ = c;
+void ShellUi::SetEditor(bool open) {
+    editor_open_ = open;
+    drag_control_ = -1;
     Redraw();
 }
 
-void ShellUi::OpenSettings(const UiSettings& current, int page) {
+void ShellUi::OpenSettings(const UiSettings& current) {
     edit_ = saved_ = current;
-    if (page >= 0 && page < int(std::size(kPages))) page_ = page;
     settings_open_ = true;
     anim_.clear();
     Redraw();
@@ -264,11 +288,28 @@ void ShellUi::MouseLeave() {
 void ShellUi::MouseDown(POINT pt) {
     const Hot* h = HotAt(pt);
     pressed_ = h ? h->key : -1;
+    if (pressed_ >= kEditorTileKey && pressed_ < kEditorTileKey + kEdCount) {
+        // A control is being dragged out of the editor (the mouse is captured, so the cursor stays).
+        drag_control_ = pressed_ - kEditorTileKey;
+        SetCursor(LoadCursor(nullptr, IDC_CROSS));
+    }
     Redraw();
 }
 
 void ShellUi::MouseUp(POINT pt) {
     const Hot* h = HotAt(pt);
+    if (drag_control_ >= 0) {
+        const int control = drag_control_;
+        drag_control_ = -1;
+        pressed_ = -1;
+        SetCursor(LoadCursor(nullptr, IDC_ARROW));
+        Redraw();
+        // Released on the tile itself: a plain click, which puts the control in the middle of the screen.
+        const bool click = h && h->key == kEditorTileKey + control;
+        if (hwnd_)
+            PostMessageW(hwnd_, WM_COMMAND, MAKEWPARAM(kUiEdDrop, control), click ? LPARAM(-1) : MAKELPARAM(pt.x, pt.y));
+        return;
+    }
     std::function<void()> act;
     if (h && h->key == pressed_) act = h->act;  // copy: the action may rebuild hots_
     pressed_ = -1;
@@ -374,10 +415,11 @@ void ShellUi::DrawBars(HDC dc, const RECT& client) {
     int y = kTopH + 4;
     auto side_btn = [&](int key, int glyph, const wchar_t* hint, UINT cmd) {
         IconButton(dc, RECT{cw - kSideW, y, cw, y + bh}, key, glyph, hint, cmd);
+        if (cmd == kUiControls) controls_btn_ = RECT{cw - kSideW, y, cw, y + bh};
         y += bh;
     };
     side_btn(10, kGlyphFullscreen, L"Full screen (F11)", kUiFullscreen);
-    side_btn(15, kGlyphKeyboard, L"Key mapping: play with the keyboard", kUiControls);
+    side_btn(15, kGlyphKeyboard, L"Game controls: play with the keyboard", kUiControls);
     side_btn(11, kGlyphCamera, L"Save a screenshot", kUiScreenshot);
     side_btn(12, kGlyphConsole, L"Android console", kUiShowConsole);
     side_btn(13, kGlyphLogs, L"Collect logs into a zip", kUiCollectLogs);
@@ -435,7 +477,6 @@ void ShellUi::DrawSettings(HDC dc, const RECT& area) {
 
     // Rows of the selected page.
     const int rx = px + list_w + 8, rw = card.right - pad - rx, ctl_w = 204, ctl_h = 34, row_h = 54;
-    const int bottom = card.bottom - 22;
     int y = top - 6;
     int key = 200;
     auto label = [&](const std::wstring& s, int h) {
@@ -524,40 +565,17 @@ void ShellUi::DrawSettings(HDC dc, const RECT& area) {
             info(L"Tip", L"A lower resolution is faster, because Android draws every pixel on the CPU.");
             break;
         }
-        case kPageControls: {
-            saved_page = false;  // these apply at once
-            toggle(L"Key mapping (keys press spots on the screen)", controls_.enabled, [this] { Command(kUiKmEnable); });
-            toggle(L"Show the keys on the screen", controls_.hints, [this] { Command(kUiKmHints); });
-            toggle(L"W A S D joystick", controls_.dpad, [this] { Command(kUiKmDpad); });
-            button(L"Joystick position", L"Place on screen", kUiKmPlaceDpad, 46, 150);
-            button(L"Map a key to a spot on the screen", L"Add key", kUiKmAdd, 46, 150);
-            const int row = 38;
-            const int fit = std::max(0, (bottom - y) / row);
-            const int shown = std::min<int>(int(controls_.taps.size()), fit);
-            for (int i = 0; i < shown; ++i) {
-                // The last visible row turns into a note when more keys exist than fit.
-                if (i == shown - 1 && shown < int(controls_.taps.size())) {
-                    Text(dc, RECT{rx, y, rx + rw, y + row},
-                         L"+ " + std::to_wstring(controls_.taps.size() - size_t(i)) +
-                             L" more keys - see config\\aetheron_keymap.txt",
-                         font_small_, kDim, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-                    break;
-                }
-                button(controls_.taps[size_t(i)], L"Remove", kUiKmRemove + UINT(i), row, 96);
-            }
-            break;
-        }
-        case 3:
+        case 2:
             toggle(L"Internet access (built-in NAT)", edit_.network, [this] { edit_.network = !edit_.network; });
             break;
-        case 4:
+        case 3:
             toggle(L"Run the clean-up script after boot", edit_.first_boot_setup,
                    [this] { edit_.first_boot_setup = !edit_.first_boot_setup; });
             info(L"Clean-up script", L"config\\aetheron_setup.sh hides unwanted apps and applies the dark theme. "
                                      L"It runs once, and again whenever the file changes.");
             button(L"Erase all Android data", L"Factory reset...", kUiWipe, row_h, ctl_w);
             break;
-        case 5:
+        case 4:
             saved_page = false;
             button(L"Android console (serial)", L"Open", kUiShowConsole, row_h, ctl_w);
             button(L"Collect logs into a zip", L"Collect", kUiCollectLogs, row_h, ctl_w);
@@ -582,6 +600,65 @@ void ShellUi::DrawSettings(HDC dc, const RECT& area) {
     }
 }
 
+// The controls editor: a panel between the Android screen and the sidebar.
+void ShellUi::DrawEditor(HDC dc, const RECT& client) {
+    const RECT panel = {client.right - kSideW - kEditorW, kTopH, client.right - kSideW, client.bottom};
+    Fill(dc, panel, kPanel);
+    Fill(dc, RECT{panel.left, panel.top, panel.left + 1, panel.bottom}, kLine);
+    const int pad = 14, x = panel.left + pad, w = kEditorW - 2 * pad;
+    int y = panel.top + 8;
+
+    Text(dc, RECT{x, y, x + w - 36, y + 36}, L"Controls editor", font_bold_, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    {
+        const RECT r = {panel.right - 44, y + 2, panel.right - 10, y + 34};
+        if (hover_ == 390) FillRound(dc, r, 9, StateColor(390, kPanel, kHover, kPress));
+        DrawIcon(dc, r, kGlyphClose, hover_ == 390 ? kText : kIcon);
+        AddHot(r, 390, [this] { Command(kUiEdDone); }, L"Close the controls editor");
+    }
+    y += 40;
+    Text(dc, RECT{x, y, x + w, y + 50}, L"Drag a control onto the Android screen, then press the key for it.",
+         font_small_, kDim, DT_LEFT | DT_WORDBREAK);
+    y += 44;
+
+    struct Tile {
+        int icon;
+        const wchar_t* name;
+    };
+    static const Tile kTiles[kEdCount] = {{kIconTap, L"Tap spot"}, {kIconRepeat, L"Repeated tap"},
+                                          {kIconDpad, L"Joystick (WASD)"}, {kIconSwipe, L"Swipe"}};
+    const int gap = 10, tw = (w - gap) / 2, th = 86;
+    for (int i = 0; i < kEdCount; ++i) {
+        const int tx = x + (i % 2) * (tw + gap), ty = y + (i / 2) * (th + gap);
+        const RECT r = {tx, ty, tx + tw, ty + th};
+        const int key = kEditorTileKey + i;
+        const bool active = drag_control_ == i;
+        FillRound(dc, r, 10, active ? kPress : StateColor(key, kControl, kHover, kPress));
+        DrawIcon(dc, RECT{r.left, r.top + 10, r.right, r.top + 50}, kTiles[i].icon, kText, 26.0f);
+        Text(dc, RECT{r.left + 4, r.top + 54, r.right - 4, r.bottom - 6}, kTiles[i].name, font_small_, kText,
+             DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        AddHot(r, key, nullptr, L"");
+    }
+    y += 2 * (th + gap) + 8;
+
+    Text(dc, RECT{x, y, x + w, y + 110},
+         L"On the screen:\n\u2022 drag a control to move it\n\u2022 click it to change its key\n"
+         L"\u2022 right-click it to remove it\n\u2022 drag a swipe's small dot to aim it",
+         font_small_, kDim, DT_LEFT | DT_WORDBREAK);
+
+    // Bottom buttons, if the window is tall enough for them.
+    const int by = panel.bottom - 14 - 36;
+    if (by > y + 112) {
+        const int bw = (w - gap) / 2;
+        const RECT clear = {x, by, x + bw, by + 36}, done = {x + bw + gap, by, x + w, by + 36};
+        FillRound(dc, clear, 10, StateColor(391, kControl, kHover, kPress));
+        Text(dc, clear, L"Remove all", font_ui_, kText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        AddHot(clear, 391, [this] { Command(kUiEdClear); }, L"");
+        FillRound(dc, done, 10, StateColor(392, kPrimary, kPrimaryHover, kDim));
+        Text(dc, done, L"Done", font_bold_, kOnPrimary, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        AddHot(done, 392, [this] { Command(kUiEdDone); }, L"");
+    }
+}
+
 void ShellUi::Paint(HDC window_dc) {
     if (!hwnd_) return;
     RECT rc;
@@ -597,6 +674,7 @@ void ShellUi::Paint(HDC window_dc) {
     Fill(dc, rc, kContent);
     if (settings_open_) DrawSettings(dc, ContentRect());
     if (bars_) DrawBars(dc, rc);
+    if (bars_ && editor_open_) DrawEditor(dc, rc);
     BitBlt(window_dc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, old);
     DeleteObject(bmp);

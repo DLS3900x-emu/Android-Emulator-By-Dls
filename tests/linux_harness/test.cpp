@@ -224,21 +224,39 @@ int main(){
     printf("virtio-vsock host stream OK\n"); }
   // ---- key mapping: keys become fingers ----
   { KeyMapper km; km.aspect = 2.0f;
-    km.Parse("# c\nenabled on\nhints off\ndpad on W A S D 0.200 0.700 0.100\ntap F 0.850 0.600\ntap space 0.9 0.9\ntap bogus 1 1\n");
-    CHECK(km.taps.size()==2 && km.taps[1].vk==0x20 && !km.hints && km.dpad.enabled);
-    KeyMapper again; again.Parse(km.Serialize()); CHECK(again.Serialize()==km.Serialize()); CHECK(again.taps.size()==2);
+    km.Parse("# c\nenabled on\nhints off\nopacity 0.5\ndpad on W A S D 0.200 0.700 0.100\ntap F 0.850 0.600\nrepeat space 0.9 0.9\n"
+             "swipe E 0.5 0.5 0.7 0.5\ntap bogus 1 1\ntap W 0.1 0.1\n");
+    CHECK(km.items.size()==3 && km.items[1].vk==0x20 && km.items[1].type==KeyMapper::kRepeat && !km.hints && km.dpad.enabled);
+    CHECK(km.opacity==0.5f);                                                            // "tap W" dropped: W is a joystick key
+    KeyMapper again; again.Parse(km.Serialize()); CHECK(again.Serialize()==km.Serialize()); CHECK(again.items.size()==3);
     std::vector<std::string> ev; char b[80];
     KeyMapper::TouchFn t=[&](int s,bool d,float x,float y){ snprintf(b,sizeof(b),"%d %d %.2f %.2f",s,int(d),x,y); ev.push_back(b); };
-    CHECK(!km.OnKey('Q',true,t)); CHECK(ev.empty());                                   // unmapped keys pass through
-    CHECK(km.OnKey('F',true,t)); CHECK(km.OnKey('F',true,t)); CHECK(ev.size()==1 && ev[0]=="2 1 0.85 0.60");   // repeat ignored
-    CHECK(km.OnKey(0x20,true,t)); CHECK(ev.back()=="3 1 0.90 0.90");                    // second finger, own slot
-    CHECK(km.OnKey('W',true,t)); CHECK(ev.size()==4 && ev[2]=="1 1 0.20 0.70" && ev[3]=="1 1 0.20 0.60");      // lands on centre, slides up
-    CHECK(km.OnKey('D',true,t)); CHECK(ev.back()=="1 1 0.24 0.63");                     // diagonal, x scaled by aspect
-    CHECK(km.OnKey('W',false,t)); CHECK(ev.back()=="1 1 0.25 0.70");
-    CHECK(km.OnKey('D',false,t)); CHECK(ev.back()=="1 0 0.20 0.70");                    // all released: finger up
-    CHECK(km.OnKey('F',false,t)); CHECK(ev.back()=="2 0 0.85 0.60");
-    size_t n=ev.size(); km.ReleaseAll(t); CHECK(ev.size()==n+1 && ev.back().substr(0,3)=="3 0");
-    km.enabled=false; CHECK(!km.OnKey('F',true,t));
+    CHECK(!km.OnKey('Q',true,0,t)); CHECK(ev.empty());                                 // unmapped keys pass through
+    CHECK(km.OnKey('F',true,0,t)); CHECK(km.OnKey('F',true,5,t)); CHECK(ev.size()==1 && ev[0]=="2 1 0.85 0.60");   // key repeat ignored
+    CHECK(!km.needs_tick());
+    CHECK(km.OnKey('W',true,0,t)); CHECK(ev.size()==3 && ev[1]=="1 1 0.20 0.70" && ev[2]=="1 1 0.20 0.60");      // lands on centre, slides up
+    CHECK(km.OnKey('D',true,0,t)); CHECK(ev.back()=="1 1 0.24 0.63");                   // diagonal, x scaled by aspect
+    CHECK(km.OnKey('W',false,0,t)); CHECK(ev.back()=="1 1 0.25 0.70");
+    CHECK(km.OnKey('D',false,0,t)); CHECK(ev.back()=="1 0 0.20 0.70");                  // all released: finger up
+    // repeated tap: down at once, up after 45 ms, down again after 90 ms, while F is still held
+    CHECK(km.OnKey(0x20,true,1000,t)); CHECK(ev.back()=="3 1 0.90 0.90"); CHECK(km.needs_tick());
+    size_t n=ev.size(); km.Tick(1020,t); CHECK(ev.size()==n);
+    km.Tick(1050,t); CHECK(ev.back()=="3 0 0.90 0.90"); km.Tick(1095,t); CHECK(ev.back()=="3 1 0.90 0.90");
+    km.Tick(1140,t); CHECK(ev.back()=="3 0 0.90 0.90");
+    n=ev.size(); CHECK(km.OnKey(0x20,false,1150,t)); CHECK(ev.size()==n); CHECK(!km.needs_tick());   // released between taps
+    // swipe: one stroke per key press, finished by the timer
+    CHECK(km.OnKey('E',true,2000,t)); CHECK(ev.back()=="3 1 0.50 0.50"); CHECK(km.needs_tick());
+    km.Tick(2080,t); CHECK(ev.back()=="3 1 0.60 0.50");
+    n=ev.size(); km.Tick(2200,t); CHECK(ev.size()==n+2 && ev[n]=="3 1 0.70 0.50" && ev[n+1]=="3 0 0.70 0.50"); CHECK(!km.needs_tick());
+    n=ev.size(); km.Tick(2300,t); CHECK(km.OnKey('E',false,2310,t)); CHECK(ev.size()==n);
+    CHECK(km.OnKey('F',false,0,t)); CHECK(ev.back()=="2 0 0.85 0.60");
+    CHECK(km.OnKey('F',true,0,t)); n=ev.size(); km.ReleaseAll(t); CHECK(ev.size()==n+1 && ev.back().substr(0,3)=="2 0");
+    // editing: a key belongs to one control only, and never to the joystick's keys
+    int i=km.AddItem(KeyMapper::kTap,0.3f,0.3f); CHECK(i==3 && km.items[3].vk==0); CHECK(!km.OnKey(0,true,0,t));
+    CHECK(km.AssignKey(i,'A')==-1); i=km.AssignKey(i,'F'); CHECK(i==2 && km.items.size()==3 && km.items[2].vk=='F' && km.items[2].x==0.3f);
+    int s=km.AddItem(KeyMapper::kSwipe,0.9f,0.5f); CHECK(km.items[s].x2<0.9f);          // no room on the right: points left
+    CHECK(km.Serialize().find("\nswipe ")==km.Serialize().rfind("\nswipe "));                 // the unassigned swipe is not saved
+    km.enabled=false; CHECK(!km.OnKey('F',true,0,t));
     CHECK(KeyMapper::KeyName(0x70)=="F1" && KeyMapper::KeyFromName("f12")==0x7B && KeyMapper::KeyFromName(KeyMapper::KeyName(191))==191);
     printf("key mapping OK\n"); }
   // ---- all 30 PCI slots used by the emulator fit on the bus ----

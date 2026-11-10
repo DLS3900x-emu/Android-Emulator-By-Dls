@@ -1,7 +1,7 @@
 // Aetheron's window chrome: top bar (title, navigation, window buttons), the
-// tool sidebar and the settings page. Everything is drawn into the main
-// window (GDI text, GDI+ shapes); clicks are reported to it as WM_COMMAND
-// with a UiCmd id.
+// tool sidebar, the settings page and the controls-editor panel. Everything
+// is drawn into the main window (GDI text, GDI+ shapes); clicks are reported
+// to it as WM_COMMAND with a UiCmd id.
 #pragma once
 #include <windows.h>
 
@@ -29,14 +29,18 @@ enum UiCmd : UINT {
     kUiMinimize,
     kUiMaximize,
     kUiSaveSettings,
-    kUiControls,       // open Settings on the Controls page
-    kUiKmEnable,       // key mapping on/off
-    kUiKmHints,
-    kUiKmDpad,
-    kUiKmPlaceDpad,
-    kUiKmAdd,
-    kUiKmRemove = 300,  // + index of the mapped key (300..399)
+    kUiControls,    // sidebar keyboard button: open/close the game-controls card
+    kUiKmEnable,    // key mapping on/off
+    kUiKmHints,     // on-screen key hints on/off
+    kUiKmOpacity,   // lParam: hint opacity in percent
+    kUiKmEditor,    // open the controls editor
+    kUiEdDrop,      // HIWORD(wParam): EditorControl; lParam: client point, or -1 for "centre of the screen"
+    kUiEdDone,
+    kUiEdClear,
 };
+
+// What can be dragged out of the controls editor.
+enum EditorControl { kEdTap = 0, kEdRepeat, kEdDpad, kEdSwipe, kEdCount };
 
 // The values the settings page edits. All of them are read at start-up.
 struct UiSettings {
@@ -50,22 +54,17 @@ struct UiSettings {
     }
 };
 
-// What the Controls page shows; the owner applies changes at once.
-struct UiControls {
-    bool enabled = true, hints = true, dpad = false;
-    std::vector<std::wstring> taps;  // one line per mapped key
-};
-
 class ShellUi {
 public:
-    static constexpr int kTopH = 40, kSideW = 48, kResizeBorder = 6;
+    static constexpr int kTopH = 40, kSideW = 48, kEditorW = 248, kResizeBorder = 6;
     static constexpr UINT_PTR kAnimTimer = 77;  // the owner forwards WM_TIMER with this id to Tick()
-    static constexpr int kPageControls = 2;
 
     void Attach(HWND hwnd) { hwnd_ = hwnd; }
     void SetBarsVisible(bool visible);
     // Client-area rectangle left for the Android screen (or the settings page).
     RECT ContentRect() const;
+    // Where the sidebar's keyboard button is (client coordinates).
+    RECT controls_button() const { return controls_btn_; }
 
     void Paint(HDC window_dc);
     void Tick() { Redraw(); }
@@ -76,9 +75,10 @@ public:
     void MouseUp(POINT pt);
 
     void SetStatus(const std::wstring& text);
-    void SetControls(const UiControls& c);
+    void SetEditor(bool open);
+    bool editor_open() const { return editor_open_; }
 
-    void OpenSettings(const UiSettings& current, int page = -1);
+    void OpenSettings(const UiSettings& current);
     void CloseSettings();
     bool settings_open() const { return settings_open_; }
     const UiSettings& settings() const { return edit_; }
@@ -103,19 +103,21 @@ private:
                     bool danger = false);
     void DrawBars(HDC dc, const RECT& client);
     void DrawSettings(HDC dc, const RECT& area);
+    void DrawEditor(HDC dc, const RECT& client);
     float Animate(int key, bool on);
 
     HWND hwnd_ = nullptr;
     bool bars_ = true;
     std::vector<Hot> hots_;
     int hover_ = -1, pressed_ = -1;
+    int drag_control_ = -1;  // EditorControl being dragged out of the editor
     std::wstring status_;
+    RECT controls_btn_ = {0, 0, 0, 0};
     HFONT font_ui_ = nullptr, font_bold_ = nullptr, font_big_ = nullptr, font_small_ = nullptr;
 
-    bool settings_open_ = false;
+    bool settings_open_ = false, editor_open_ = false;
     int page_ = 0;
     UiSettings edit_, saved_;
-    UiControls controls_;
     std::map<int, float> anim_;  // toggle key -> knob position 0..1
     bool animating_ = false, timer_on_ = false;
 };

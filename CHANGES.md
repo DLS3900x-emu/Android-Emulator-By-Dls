@@ -1,3 +1,21 @@
+# v11
+
+- **Game controls card**: the keyboard button in the sidebar opens a small
+  card with key mapping on/off, "show keys on screen", an opacity slider for
+  those hints, and the way into the controls editor.
+- **Controls editor**: a panel next to the Android screen. Drag a control
+  onto the screen (or click it to put it in the middle), then press its key.
+  On the screen, drag a control to move it, click it to change its key,
+  right-click to remove it. Everything is saved as you go.
+- **Control types** (all of them send real touches): tap spot, repeated tap
+  (taps for as long as the key is held), W A S D joystick, swipe (drag the
+  small dot to aim it).
+- Key mapping is no longer a page in Settings.
+
+Tested here: key-mapping logic incl. repeated taps and swipes (harness), the
+card and the editor rendered under Wine, clean Windows cross-build. Not
+tested: the popup window, drag and drop and the controls on a real PC.
+
 # v10
 
 - **Icons are drawn by Aetheron itself** (vector shapes) instead of coming

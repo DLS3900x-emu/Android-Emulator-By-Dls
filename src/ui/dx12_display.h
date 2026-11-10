@@ -34,7 +34,7 @@ public:
     // Boot screen with a progress bar; `percent` and `text` come from real boot stages.
     void SetSplash(bool show, int percent, const std::wstring& text);
     // Posts `msg` (wParam = width, lParam = height) to `target` when the guest resolution changes.
-    void SetOverlay(std::vector<OverlayMarker> markers);
+    void SetOverlay(std::vector<OverlayMarker> markers, float opacity = 1.0f);
     void SetLayoutNotify(HWND target, UINT msg) {
         notify_hwnd_ = target;
         notify_msg_ = msg;
@@ -58,6 +58,8 @@ private:
     std::vector<OverlayMarker> overlay_;              // guarded by splash_mutex_
     std::atomic<uint64_t> overlay_version_{0};
     uint64_t overlay_built_ = ~0ULL;
+    float overlay_opacity_ = 1.0f;                    // guarded by splash_mutex_
+    uint32_t disc_alpha_ = 150, text_alpha_ = 255;
     uint32_t overlay_w_ = 0, overlay_h_ = 0;
     std::vector<uint8_t> overlay_disc_, overlay_text_;  // coverage masks, width*height
     std::vector<RECT> overlay_rects_;                 // where the masks are not empty

@@ -114,9 +114,10 @@ void Dx12Display::SetSplash(bool show, int percent, const std::wstring& text) {
     ++splash_version_;
 }
 
-void Dx12Display::SetOverlay(std::vector<OverlayMarker> markers) {
+void Dx12Display::SetOverlay(std::vector<OverlayMarker> markers, float opacity) {
     std::lock_guard<std::mutex> lock(splash_mutex_);
     overlay_ = std::move(markers);
+    overlay_opacity_ = opacity < 0 ? 0 : opacity > 1 ? 1 : opacity;
     ++overlay_version_;
 }
 
@@ -128,6 +129,8 @@ void Dx12Display::BuildOverlay() {
         std::lock_guard<std::mutex> lock(splash_mutex_);
         markers = overlay_;
         overlay_built_ = overlay_version_;
+        disc_alpha_ = uint32_t(190 * overlay_opacity_);
+        text_alpha_ = uint32_t(255 * (0.35f + 0.65f * overlay_opacity_));
     }
     overlay_w_ = width_;
     overlay_h_ = height_;
@@ -192,7 +195,8 @@ void Dx12Display::BlendOverlay(uint8_t* dst) {
             uint8_t* row = dst + size_t(y) * pitch_;
             const size_t base = size_t(y) * overlay_w_;
             for (int x = r.left; x < r.right; ++x) {
-                const uint32_t disc = overlay_disc_[base + x] * 150u / 255u, text = overlay_text_[base + x];
+                const uint32_t disc = overlay_disc_[base + x] * disc_alpha_ / 255u,
+                               text = overlay_text_[base + x] * text_alpha_ / 255u;
                 if (!disc && !text) continue;
                 uint8_t* p = row + size_t(x) * 4;
                 for (int c = 0; c < 3; ++c) {

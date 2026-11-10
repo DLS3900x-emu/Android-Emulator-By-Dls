@@ -1,18 +1,19 @@
 // Developer tool: paints Aetheron's window chrome into .bmp files without
 // starting a VM, so the look can be checked (also under Wine):
 //   x86_64-w64-mingw32-g++-posix -std=c++17 -DUNICODE -D_UNICODE -DNOMINMAX -I../../src preview.cpp \
-//       ../../src/ui/shell_ui.cpp -o preview.exe -static -lgdiplus -lgdi32 -luser32
+//       ../../src/ui/shell_ui.cpp ../../src/ui/controls_ui.cpp -o preview.exe -static -lgdiplus -lgdi32 -luser32 -ldwmapi
 #include <windows.h>
 
 #include <cstdio>
-#include <vector>
+#include <functional>
 
+#include "ui/controls_ui.h"
 #include "ui/gdiplus_util.h"
 #include "ui/shell_ui.h"
 
 using namespace Aetheron;
 
-static void Save(ShellUi& ui, int w, int h, const char* path) {
+static void Save(int w, int h, const char* path, const std::function<void(HDC)>& paint) {
     BITMAPINFO bi = {};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bi.bmiHeader.biWidth = w;
@@ -23,8 +24,8 @@ static void Save(ShellUi& ui, int w, int h, const char* path) {
     HDC dc = CreateCompatibleDC(nullptr);
     HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     SelectObject(dc, bmp);
-    ui.Paint(dc);
-    ui.Paint(dc);  // second pass: hints for hovered items are known after the first
+    paint(dc);
+    paint(dc);  // second pass: hints for hovered items are known after the first
     GdiFlush();
     BITMAPFILEHEADER fh = {};
     fh.bfType = 0x4D42;
@@ -46,24 +47,25 @@ int main() {
     wc.lpfnWndProc = DefWindowProcW;
     wc.lpszClassName = L"AetheronPreview";
     RegisterClassW(&wc);
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"", WS_POPUP, 0, 0, w, h, HWND_MESSAGE, nullptr, nullptr, nullptr);  // message-only: needs no desktop
+    // message-only: needs no desktop
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"", WS_POPUP, 0, 0, w, h, HWND_MESSAGE, nullptr, nullptr, nullptr);
     if (!hwnd) return 1;
     ShellUi ui;
     ui.Attach(hwnd);
     ui.SetStatus(L"guest running: Android boot completed");
-    UiControls c;
-    c.dpad = true;
-    c.taps = {L"F   presses the spot at 85%, 60%", L"SPACE   presses the spot at 90%, 90%"};
-    ui.SetControls(c);
+    auto paint = [&](HDC dc) { ui.Paint(dc); };
+    Save(w, h, "chrome.bmp", paint);
+    ui.SetEditor(true);
+    ui.MouseMove(POINT{w - 48 - 60, 200});  // hover an editor tile
+    Save(w, h, "editor.bmp", paint);
+    ui.SetEditor(false);
     UiSettings s;
     s.cpus = 4;
-    Save(ui, w, h, "chrome.bmp");
-    for (int page = 0; page < 3; ++page) {
-        ui.OpenSettings(s, page);
-        ui.MouseMove(POINT{w - 30, 150});  // hover a sidebar button
-        char name[32];
-        snprintf(name, sizeof(name), "settings%d.bmp", page);
-        Save(ui, w, h, name);
-    }
+    ui.OpenSettings(s);
+    Save(w, h, "settings.bmp", paint);
+
+    ControlsPopup popup;  // painted without its window
+    popup.SetState(true, false, 0.7f);
+    Save(ControlsPopup::kW, ControlsPopup::kH, "popup.bmp", [&](HDC dc) { popup.Paint(dc); });
     return 0;
 }

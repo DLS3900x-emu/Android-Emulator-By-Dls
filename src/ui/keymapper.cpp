@@ -45,11 +45,40 @@ uint32_t KeyMapper::KeyFromName(const std::string& raw) {
     return 0;
 }
 
+bool KeyMapper::IsDpadKey(uint32_t vk) const {
+    return dpad.enabled && (vk == dpad.up || vk == dpad.left || vk == dpad.down || vk == dpad.right);
+}
+
+int KeyMapper::AddItem(Type type, float x, float y) {
+    Item it;
+    it.type = type;
+    it.x = Clamp01(x);
+    it.y = Clamp01(y);
+    // A swipe starts out pointing right (or left when there is no room).
+    it.x2 = it.x <= 0.8f ? it.x + 0.15f : it.x - 0.15f;
+    it.y2 = it.y;
+    items.push_back(it);
+    return int(items.size()) - 1;
+}
+
+int KeyMapper::AssignKey(int index, uint32_t vk) {
+    if (index < 0 || index >= int(items.size()) || !vk) return -1;
+    if (IsDpadKey(vk)) return -1;
+    for (int i = int(items.size()) - 1; i >= 0; --i) {
+        if (i == index || items[size_t(i)].vk != vk) continue;
+        items.erase(items.begin() + i);
+        if (i < index) --index;
+    }
+    items[size_t(index)].vk = vk;
+    return index;
+}
+
 void KeyMapper::Parse(const std::string& text) {
-    taps.clear();
+    items.clear();
     dpad = Dpad();
     enabled = true;
     hints = true;
+    opacity = 0.7f;
     std::istringstream ss(text);
     std::string line;
     while (std::getline(ss, line)) {
@@ -64,12 +93,26 @@ void KeyMapper::Parse(const std::string& text) {
             std::string v;
             ls >> v;
             (word == "enabled" ? enabled : hints) = v == "on";
-        } else if (word == "tap") {
+        } else if (word == "opacity") {
+            float v = 0;
+            if (ls >> v) opacity = v < 0.2f ? 0.2f : v > 1 ? 1 : v;
+        } else if (word == "tap" || word == "repeat" || word == "swipe") {
             std::string key;
             float x = 0, y = 0;
-            if (ls >> key >> x >> y) {
-                const uint32_t vk = KeyFromName(key);
-                if (vk) SetTap(vk, x, y);
+            if (!(ls >> key >> x >> y)) continue;
+            const uint32_t vk = KeyFromName(key);
+            if (!vk) continue;
+            const Type type = word == "tap" ? kTap : word == "repeat" ? kRepeat : kSwipe;
+            float x2 = 0, y2 = 0;
+            if (type == kSwipe && !(ls >> x2 >> y2)) continue;
+            const int i = AssignKey(AddItem(type, x, y), vk);
+            if (i < 0) {
+                items.pop_back();  // the key is one of the joystick's
+                continue;
+            }
+            if (type == kSwipe) {
+                items[size_t(i)].x2 = Clamp01(x2);
+                items[size_t(i)].y2 = Clamp01(y2);
             }
         } else if (word == "dpad") {
             std::string on, k[4];
@@ -89,33 +132,33 @@ void KeyMapper::Parse(const std::string& text) {
             }
         }
     }
+    // A key cannot be both a joystick direction and a control.
+    for (int i = int(items.size()) - 1; i >= 0; --i)
+        if (IsDpadKey(items[size_t(i)].vk)) items.erase(items.begin() + i);
 }
 
 std::string KeyMapper::Serialize() const {
-    char b[160];
-    std::string out = "# Aetheron key mapping. Edit here or in Settings -> Controls.\n"
-                      "# tap <key> <x> <y>     dpad on|off <up> <left> <down> <right> <x> <y> <radius>\n";
+    char b[200];
+    std::string out = "# Aetheron key mapping. Edit here or in the controls editor (keyboard button in the sidebar).\n"
+                      "# tap|repeat <key> <x> <y>    swipe <key> <x> <y> <x2> <y2>\n"
+                      "# dpad on|off <up> <left> <down> <right> <x> <y> <radius>\n";
     out += std::string("enabled ") + (enabled ? "on" : "off") + "\n";
     out += std::string("hints ") + (hints ? "on" : "off") + "\n";
+    snprintf(b, sizeof(b), "opacity %.2f\n", opacity);
+    out += b;
     snprintf(b, sizeof(b), "dpad %s %s %s %s %s %.3f %.3f %.3f\n", dpad.enabled ? "on" : "off", KeyName(dpad.up).c_str(),
              KeyName(dpad.left).c_str(), KeyName(dpad.down).c_str(), KeyName(dpad.right).c_str(), dpad.x, dpad.y,
              dpad.radius);
     out += b;
-    for (const Tap& t : taps) {
-        snprintf(b, sizeof(b), "tap %s %.3f %.3f\n", KeyName(t.vk).c_str(), t.x, t.y);
+    for (const Item& t : items) {
+        if (!t.vk) continue;
+        if (t.type == kSwipe)
+            snprintf(b, sizeof(b), "swipe %s %.3f %.3f %.3f %.3f\n", KeyName(t.vk).c_str(), t.x, t.y, t.x2, t.y2);
+        else
+            snprintf(b, sizeof(b), "%s %s %.3f %.3f\n", t.type == kTap ? "tap" : "repeat", KeyName(t.vk).c_str(), t.x, t.y);
         out += b;
     }
     return out;
-}
-
-void KeyMapper::SetTap(uint32_t vk, float x, float y) {
-    for (Tap& t : taps)
-        if (t.vk == vk) {
-            t.x = Clamp01(x);
-            t.y = Clamp01(y);
-            return;
-        }
-    taps.push_back({vk, Clamp01(x), Clamp01(y)});
 }
 
 void KeyMapper::UpdateDpad(uint8_t before, const TouchFn& touch) {
@@ -135,8 +178,8 @@ void KeyMapper::UpdateDpad(uint8_t before, const TouchFn& touch) {
     touch(kDpadSlot, true, Clamp01(dpad.x + dx * dpad.radius / aspect), Clamp01(dpad.y + dy * dpad.radius));
 }
 
-bool KeyMapper::OnKey(uint32_t vk, bool down, const TouchFn& touch) {
-    if (!enabled) return false;
+bool KeyMapper::OnKey(uint32_t vk, bool down, uint64_t now_ms, const TouchFn& touch) {
+    if (!enabled || !vk) return false;
     if (dpad.enabled) {
         const int bit = vk == dpad.up ? 0 : vk == dpad.left ? 1 : vk == dpad.down ? 2 : vk == dpad.right ? 3 : -1;
         if (bit >= 0) {
@@ -147,21 +190,22 @@ bool KeyMapper::OnKey(uint32_t vk, bool down, const TouchFn& touch) {
             return true;
         }
     }
-    for (const Tap& t : taps) {
+    for (const Item& t : items) {
         if (t.vk != vk) continue;
         auto it = held_.find(vk);
         if (down) {
             if (it != held_.end()) return true;  // key repeat
             bool used[kSlots] = {};
-            for (auto& h : held_) used[h.second] = true;
-            for (int slot = kFirstTapSlot; slot < kSlots; ++slot) {
+            for (auto& h : held_)
+                if (h.second.down || h.second.item.type == kRepeat) used[h.second.slot] = true;
+            for (int slot = kFirstSlot; slot < kSlots; ++slot) {
                 if (used[slot]) continue;
-                held_[vk] = slot;
+                held_[vk] = Held{slot, now_ms, true, t};
                 touch(slot, true, t.x, t.y);
                 break;
             }
         } else if (it != held_.end()) {
-            touch(it->second, false, t.x, t.y);
+            if (it->second.down) touch(it->second.slot, false, t.x, t.y);
             held_.erase(it);
         }
         return true;
@@ -169,10 +213,40 @@ bool KeyMapper::OnKey(uint32_t vk, bool down, const TouchFn& touch) {
     return false;
 }
 
+void KeyMapper::Tick(uint64_t now_ms, const TouchFn& touch) {
+    for (auto& e : held_) {
+        Held& h = e.second;
+        const uint64_t dt = now_ms - h.t0;
+        if (h.item.type == kRepeat) {
+            const bool want = (dt / kRepeatHalfMs) % 2 == 0;
+            if (want != h.down) {
+                h.down = want;
+                touch(h.slot, want, h.item.x, h.item.y);
+            }
+        } else if (h.item.type == kSwipe && h.down) {
+            const float p = float(dt) / float(kSwipeMs);
+            if (p >= 1) {
+                touch(h.slot, true, h.item.x2, h.item.y2);
+                touch(h.slot, false, h.item.x2, h.item.y2);
+                h.down = false;  // one swipe per key press
+            } else {
+                touch(h.slot, true, h.item.x + (h.item.x2 - h.item.x) * p, h.item.y + (h.item.y2 - h.item.y) * p);
+            }
+        }
+    }
+}
+
+bool KeyMapper::needs_tick() const {
+    for (auto& e : held_)
+        if (e.second.item.type == kRepeat || (e.second.item.type == kSwipe && e.second.down)) return true;
+    return false;
+}
+
 void KeyMapper::ReleaseAll(const TouchFn& touch) {
     if (dpad_state_) touch(kDpadSlot, false, dpad.x, dpad.y);
     dpad_state_ = 0;
-    for (auto& h : held_) touch(h.second, false, 0, 0);
+    for (auto& h : held_)
+        if (h.second.down) touch(h.second.slot, false, h.second.item.x, h.second.item.y);
     held_.clear();
 }
 
