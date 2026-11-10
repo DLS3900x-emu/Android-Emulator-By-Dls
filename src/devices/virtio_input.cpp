@@ -77,6 +77,7 @@ void VirtioInput::Refresh() {
                 }
             } else if (subsel_ == kEvKey) {
                 for (int k = 1; k <= 248; ++k) set_bit(k);
+                set_bit(580);  // KEY_APPSELECT (Android: recent apps)
             }
             break;
         case kCfgAbsInfo:

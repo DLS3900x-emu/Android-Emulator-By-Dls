@@ -44,6 +44,7 @@
 #include "ui/boot_stage.h"
 #include "ui/keymap.h"
 #include "ui/serial_console.h"
+#include "ui/shell_ui.h"
 #include "vmm/guest_memory.h"
 #include "vmm/whpx_vm.h"
 
@@ -91,6 +92,7 @@ struct Settings {
     uint64_t ram_mb = 4096;
     uint32_t cpus = 1;
     uint32_t width = 1280, height = 720;
+    uint32_t dpi = 160;
     bool network = true;
     bool boot_splash = true;
     bool first_boot_setup = true;
@@ -120,6 +122,12 @@ struct App {
     HWND view = nullptr;  // child window showing the guest screen at its aspect ratio
     uint32_t view_w = 0, view_h = 0;
     std::atomic<bool> reveal{false};
+    ShellUi ui;
+    UiSettings pending;  // what the settings page shows (saved values)
+    HMENU popup = nullptr;
+    bool fullscreen = false;
+    bool tracking_mouse = false;
+    WINDOWPLACEMENT saved_placement = {};
     SerialConsole console;
     std::unique_ptr<BootStageTracker> stage;
     ScanoutBuffer scanout;
@@ -202,6 +210,7 @@ void LoadSettings() {
         else if (k == "cpus") g.s.cpus = std::stoul(v);
         else if (k == "display_width") g.s.width = std::stoul(v);
         else if (k == "display_height") g.s.height = std::stoul(v);
+        else if (k == "display_dpi") g.s.dpi = std::stoul(v);
         else if (k == "cmdline_extra") g.s.cmdline_extra = v;
         else if (k == "network") g.s.network = (v == "on" || v == "1" || v == "true");
         else if (k == "boot_splash") g.s.boot_splash = (v == "on" || v == "1" || v == "true");
@@ -425,6 +434,8 @@ bool SetupAndStart() {
             Log("bootconfig: %ls not found, using only vendor_boot values", g.s.bootconfig_file.c_str());
         ParseBootconfig(text, &bc);
     }
+    // The density from aetheron.ini (settings page) wins over the bootconfig file.
+    ParseBootconfig("androidboot.lcd_density = " + std::to_string(g.s.dpi) + "\n", &bc);
     AddFstabSuffix(boot, parts, &bc);
     std::string bootconfig;
     for (auto& e : bc) bootconfig += e.first + " = " + e.second + "\n";
@@ -614,33 +625,218 @@ void RequestWipe(HWND hwnd) {
                 L"Aetheron", MB_OK | MB_ICONINFORMATION);
 }
 
+// Writes the settings page's values into aetheron.ini, keeping comments and
+// every other line as they are.
+bool SaveSettingsToIni(const UiSettings& u) {
+    const std::vector<std::pair<std::string, std::string>> values = {
+        {"ram_mb", std::to_string(u.ram_mb)},
+        {"display_width", std::to_string(u.width)},
+        {"display_height", std::to_string(u.height)},
+        {"display_dpi", std::to_string(u.dpi)},
+        {"network", u.network ? "on" : "off"},
+        {"boot_splash", u.boot_splash ? "on" : "off"},
+        {"first_boot_setup", u.first_boot_setup ? "on" : "off"},
+    };
+    const std::wstring path = g.s.base_dir + L"\\aetheron.ini";
+    std::string text;
+    ReadTextFile(path, &text);
+    std::vector<std::string> lines;
+    {
+        std::istringstream ss(text);
+        std::string line;
+        while (std::getline(ss, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            lines.push_back(line);
+        }
+    }
+    for (const auto& kv : values) {
+        bool found = false;
+        for (std::string& line : lines) {
+            const size_t eq = line.find('=');
+            if (eq == std::string::npos || Trim(line.substr(0, eq)) != kv.first) continue;
+            line = kv.first + " = " + kv.second;
+            found = true;
+        }
+        if (!found) lines.push_back(kv.first + " = " + kv.second);
+    }
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    if (!f) return false;
+    bool ok = true;
+    for (const std::string& line : lines) ok = ok && fprintf(f, "%s\r\n", line.c_str()) >= 0;
+    fclose(f);
+    return ok;
+}
+
+// Saves the current Android picture as a .bmp in <Aetheron>\screenshots.
+void SaveScreenshot() {
+    std::vector<uint32_t> px;
+    uint32_t w = 0, h = 0;
+    {
+        std::lock_guard<std::mutex> lock(g.scanout.mutex);
+        if (g.scanout.enabled) {
+            w = g.scanout.width;
+            h = g.scanout.height;
+            px = g.scanout.bgra;
+        }
+    }
+    if (!w || !h || px.size() < size_t(w) * h) {
+        SetStatus("screenshot: Android has not drawn anything yet");
+        return;
+    }
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    wchar_t name[80];
+    swprintf(name, 80, L"aetheron_%04u%02u%02u_%02u%02u%02u.bmp", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    const std::wstring dir = g.s.base_dir + L"\\screenshots";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    BITMAPFILEHEADER fh = {};
+    BITMAPINFOHEADER ih = {};
+    ih.biSize = sizeof(ih);
+    ih.biWidth = LONG(w);
+    ih.biHeight = -LONG(h);  // top-down
+    ih.biPlanes = 1;
+    ih.biBitCount = 32;
+    ih.biCompression = BI_RGB;
+    ih.biSizeImage = w * h * 4;
+    fh.bfType = 0x4D42;
+    fh.bfOffBits = sizeof(fh) + sizeof(ih);
+    fh.bfSize = fh.bfOffBits + ih.biSizeImage;
+    FILE* f = _wfopen((dir + L"\\" + name).c_str(), L"wb");
+    const bool ok = f && fwrite(&fh, sizeof(fh), 1, f) == 1 && fwrite(&ih, sizeof(ih), 1, f) == 1 &&
+                    fwrite(px.data(), 4, size_t(w) * h, f) == size_t(w) * h;
+    if (f) fclose(f);
+    SetStatus(ok ? "screenshot saved in the screenshots folder: " + Narrow(name) : "screenshot: could not write the file");
+}
+
+// Presses and releases one key on the guest keyboard (Linux key code).
+void TapKey(uint16_t code) {
+    if (!g.keyboard) return;
+    InputEvent ev[4] = {{1, code, 1}, {0, 0, 0}, {1, code, 0}, {0, 0, 0}};
+    g.keyboard->Send(ev, 4);
+}
+
+void LayoutView();
+
+void ToggleFullscreen() {
+    const LONG_PTR style = GetWindowLongPtrW(g.hwnd, GWL_STYLE);
+    if (!g.fullscreen) {
+        g.saved_placement.length = sizeof(g.saved_placement);
+        GetWindowPlacement(g.hwnd, &g.saved_placement);
+        MONITORINFO mi = {};
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(MonitorFromWindow(g.hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+        g.fullscreen = true;
+        g.ui.SetBarsVisible(false);
+        SetWindowLongPtrW(g.hwnd, GWL_STYLE, (style & ~LONG_PTR(WS_OVERLAPPEDWINDOW)) | WS_POPUP);
+        SetWindowPos(g.hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+    } else {
+        g.fullscreen = false;
+        g.ui.SetBarsVisible(true);
+        SetWindowLongPtrW(g.hwnd, GWL_STYLE, (style & ~LONG_PTR(WS_POPUP)) | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(g.hwnd, &g.saved_placement);
+        SetWindowPos(g.hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    }
+    LayoutView();
+}
+
+// Opens or closes the settings page; the Android screen is hidden meanwhile.
+void ToggleSettings() {
+    if (g.ui.settings_open()) g.ui.CloseSettings();
+    else g.ui.OpenSettings(g.pending);
+    ShowWindow(g.view, g.ui.settings_open() ? SW_HIDE : SW_SHOW);
+}
+
 // Keeps the guest screen centred at the guest's aspect ratio (black bars
 // around it) instead of stretching it over the whole window.
 void LayoutView() {
     if (!g.view || !g.hwnd) return;
-    RECT rc;
-    GetClientRect(g.hwnd, &rc);
+    const RECT rc = g.ui.ContentRect();
     const int64_t gw = g.view_w ? g.view_w : g.s.width, gh = g.view_h ? g.view_h : g.s.height;
-    const int cw = rc.right, ch = rc.bottom;
+    const int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
     if (cw <= 0 || ch <= 0 || gw <= 0 || gh <= 0) return;
     int w = cw, h = int(cw * gh / gw);
     if (h > ch) {
         h = ch;
         w = int(ch * gw / gh);
     }
-    MoveWindow(g.view, (cw - w) / 2, (ch - h) / 2, w, h, TRUE);
+    MoveWindow(g.view, rc.left + (cw - w) / 2, rc.top + (ch - h) / 2, w, h, TRUE);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (hwnd != g.view) {
+        // The main window: its whole client area is Aetheron's own chrome.
+        const POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        switch (msg) {
+            case WM_NCCALCSIZE:
+                if (!wp) break;
+                if (IsZoomed(hwnd) && !g.fullscreen) {
+                    // A maximised window hangs over the screen edge by its frame; pull the client back in.
+                    auto* p = reinterpret_cast<NCCALCSIZE_PARAMS*>(lp);
+                    const int fx = GetSystemMetrics(SM_CXFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+                    const int fy = GetSystemMetrics(SM_CYFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+                    p->rgrc[0].left += fx;
+                    p->rgrc[0].right -= fx;
+                    p->rgrc[0].top += fy;
+                    p->rgrc[0].bottom -= fy;
+                }
+                return 0;  // no system title bar or borders: the client area is the whole window
+            case WM_NCHITTEST: {
+                POINT c = pt;
+                ScreenToClient(hwnd, &c);
+                return g.ui.HitTest(hwnd, c, !IsZoomed(hwnd) && !g.fullscreen);
+            }
+            case WM_NCACTIVATE:
+                return DefWindowProcW(hwnd, msg, wp, -1);  // keep Windows from painting a frame
+            case WM_GETMINMAXINFO: {
+                auto* mm = reinterpret_cast<MINMAXINFO*>(lp);
+                mm->ptMinTrackSize.x = 520;
+                mm->ptMinTrackSize.y = 360;
+                return 0;
+            }
+            case WM_ERASEBKGND:
+                return 1;
+            case WM_PAINT: {
+                PAINTSTRUCT ps;
+                HDC dc = BeginPaint(hwnd, &ps);
+                g.ui.Paint(dc);
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
+            case WM_MOUSEMOVE:
+                if (!g.tracking_mouse) {
+                    TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
+                    g.tracking_mouse = TrackMouseEvent(&tme) != 0;
+                }
+                g.ui.MouseMove(pt);
+                return 0;
+            case WM_MOUSELEAVE:
+                g.tracking_mouse = false;
+                g.ui.MouseLeave();
+                return 0;
+            case WM_LBUTTONDOWN:
+                SetCapture(hwnd);
+                g.ui.MouseDown(pt);
+                return 0;
+            case WM_LBUTTONUP:
+                ReleaseCapture();
+                g.ui.MouseUp(pt);
+                return 0;
+        }
+    }
     switch (msg) {
         case WM_APP_STATUS: {
             auto* s = reinterpret_cast<std::wstring*>(lp);
             SetWindowTextW(hwnd, (L"Aetheron - " + *s).c_str());
+            g.ui.SetStatus(*s);
             delete s;
             return 0;
         }
         case WM_SIZE:
-            if (hwnd == g.hwnd) LayoutView();
+            if (hwnd == g.hwnd) {
+                LayoutView();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
             break;
         case WM_APP_LAYOUT:
             g.view_w = uint32_t(wp);
@@ -667,6 +863,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_KEYUP:
         case WM_SYSKEYDOWN:
         case WM_SYSKEYUP: {
+            if (wp == VK_F11) {
+                if (msg == WM_KEYDOWN && !(lp & (1 << 30))) ToggleFullscreen();
+                return 0;
+            }
+            if (g.ui.settings_open()) break;  // typing must not reach Android behind the settings page
             if (!g.keyboard) break;
             bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
             bool repeat = down && (lp & (1 << 30));
@@ -684,6 +885,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     ShellExecuteW(hwnd, L"open", g.s.base_dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                     return 0;
                 case kCmdWipe: RequestWipe(hwnd); return 0;
+                case kUiBack: TapKey(158); return 0;     // KEY_BACK
+                case kUiHome: TapKey(172); return 0;     // KEY_HOMEPAGE
+                case kUiRecents: TapKey(580); return 0;  // KEY_APPSELECT
+                case kUiFullscreen: ToggleFullscreen(); return 0;
+                case kUiScreenshot: SaveScreenshot(); return 0;
+                case kUiSettings: ToggleSettings(); return 0;
+                case kUiSaveSettings:
+                    if (SaveSettingsToIni(g.ui.settings())) {
+                        g.pending = g.ui.settings();
+                        g.ui.MarkSaved();
+                        SetStatus("settings saved - they apply the next time Aetheron starts");
+                    } else {
+                        SetStatus("settings: could not write aetheron.ini");
+                    }
+                    return 0;
+                case kUiMenu: {
+                    POINT p;
+                    GetCursorPos(&p);
+                    TrackPopupMenu(g.popup, TPM_RIGHTALIGN | TPM_TOPALIGN, p.x, p.y, 0, hwnd, nullptr);
+                    return 0;
+                }
+                case kUiMinimize: ShowWindow(hwnd, SW_MINIMIZE); return 0;
+                case kUiMaximize: ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE); return 0;
                 case kCmdSkipSplash:
                     g.reveal = true;
                     UpdateSplash("");
@@ -753,8 +977,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (fit_w < scale) scale = fit_w;
     if (scale > 1.0) scale = 1.0;
     RECT r = {0, 0, LONG(g.s.width * scale), LONG(g.s.height * scale)};
-    HMENU menu = CreateMenu();
     HMENU logs = CreatePopupMenu();
+    g.popup = logs;
+    AppendMenuW(logs, MF_STRING, kUiSettings, L"&Settings");
+    AppendMenuW(logs, MF_STRING, kUiFullscreen, L"&Full screen\tF11");
+    AppendMenuW(logs, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(logs, MF_STRING, kCmdShowConsole, L"Show serial &console");
     AppendMenuW(logs, MF_STRING, kCmdCollectLogs, L"&Collect logs (zip)");
     AppendMenuW(logs, MF_STRING, kCmdOpenFolder, L"&Open Aetheron folder");
@@ -763,17 +990,25 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     AppendMenuW(logs, MF_STRING, kCmdWipe, L"&Factory reset (erase Android data)...");
     AppendMenuW(logs, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(logs, MF_STRING, kCmdExit, L"E&xit");
-    AppendMenuW(menu, MF_POPUP, UINT_PTR(logs), L"&Aetheron");
-    RECT r2 = r;
-    AdjustWindowRect(&r2, WS_OVERLAPPEDWINDOW, TRUE);
-    g.hwnd = CreateWindowExW(0, wc.lpszClassName, L"Aetheron - starting", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT,
-                             CW_USEDEFAULT, r2.right - r2.left, r2.bottom - r2.top, nullptr, menu, inst, nullptr);
+    // The window has no system frame (see WM_NCCALCSIZE): its size is the
+    // Android screen plus Aetheron's top bar and sidebar.
+    g.hwnd = CreateWindowExW(0, wc.lpszClassName, L"Aetheron - starting", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                             CW_USEDEFAULT, CW_USEDEFAULT, r.right + ShellUi::kSideW, r.bottom + ShellUi::kTopH, nullptr,
+                             nullptr, inst, nullptr);
     if (!g.hwnd) return 1;
+    g.ui.Attach(g.hwnd);
+    g.pending.ram_mb = g.s.ram_mb;
+    g.pending.width = g.s.width;
+    g.pending.height = g.s.height;
+    g.pending.dpi = g.s.dpi;
+    g.pending.network = g.s.network;
+    g.pending.boot_splash = g.s.boot_splash;
+    g.pending.first_boot_setup = g.s.first_boot_setup;
+    SetWindowPos(g.hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
     ShowWindow(g.hwnd, SW_SHOW);
     g.console.Create(inst, [](const std::string& line) {
         if (g.uart) g.uart->InjectInput(line.data(), line.size());
     });
-    g.console.Show();
 
     std::string err;
     WNDCLASSW vc = {};

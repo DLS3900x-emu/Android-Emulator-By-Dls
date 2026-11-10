@@ -43,6 +43,7 @@ private:
     uint32_t pitch_ = 0;
     ScanoutBuffer* scanout_ = nullptr;
     uint64_t last_frame_ = ~0ULL;
+    uint32_t idle_frames_ = 0;
     HWND notify_hwnd_ = nullptr;
     UINT notify_msg_ = 0;
     std::mutex splash_mutex_;

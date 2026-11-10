@@ -1,3 +1,24 @@
+# v7
+
+- **Own window chrome in a gray theme** (no Windows title bar or menu bar):
+  - Top bar: name, Back / Home / Recent apps, the current status (or what the
+    button under the mouse does), menu, minimise, maximise, close. Drag the
+    bar to move the window; double-click it to maximise.
+  - Sidebar: full screen (F11), screenshot (saved as .bmp in `screenshots\`),
+    Android console, collect logs, open folder, and at the bottom Settings,
+    Back, Home, Recent apps.
+- **Settings page** (gear in the sidebar). Every control changes a real
+  value in `aetheron.ini`: memory, resolution, pixel density, boot screen,
+  Internet, clean-up script, factory reset. They apply on the next start.
+  CPU cores and graphics are shown as plain facts because there is nothing
+  to choose yet (1 core, software rendering).
+- Pixel density moved to `display_dpi` in `aetheron.ini`.
+- The serial console window no longer opens by itself at start.
+- The display thread no longer copies and presents frames when Android has
+  drawn nothing new.
+
+Not tested on Windows (cross-compiled only).
+
 # v5
 
 - **Screen is no longer stretched.** The Android screen keeps its aspect

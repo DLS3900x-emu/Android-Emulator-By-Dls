@@ -197,6 +197,7 @@ void Dx12Display::RenderLoop() {
 }
 
 bool Dx12Display::PresentFrame() {
+    bool idle = false;
     {
         std::lock_guard<std::mutex> lock(scanout_->mutex);
         if (scanout_->enabled && scanout_->width && scanout_->height &&
@@ -207,6 +208,10 @@ bool Dx12Display::PresentFrame() {
         const bool splash = splash_on_;
         // The top bit keeps boot-screen versions distinct from guest frame numbers.
         const uint64_t frame = splash ? (0x8000000000000000ULL | splash_version_.load()) : scanout_->frame.load();
+        // Nothing new to show: skip the copy and the present (re-present now
+        // and then so a resized window never keeps a stale picture for long).
+        idle = frame == last_frame_ && ++idle_frames_ < 120;
+        if (!idle) idle_frames_ = 0;
         if (frame != last_frame_) {
             void* p = nullptr;
             D3D12_RANGE none = {0, 0};
@@ -225,6 +230,10 @@ bool Dx12Display::PresentFrame() {
         }
     }
 
+    if (idle) {
+        Sleep(4);  // outside the scanout lock
+        return true;
+    }
     UINT idx = swap_->GetCurrentBackBufferIndex();
     alloc_->Reset();
     list_->Reset(alloc_.Get(), nullptr);
