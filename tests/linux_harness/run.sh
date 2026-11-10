@@ -8,7 +8,7 @@ S=../../src
 python3 mkimgs.py imgs
 g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Ishim -I$S -include cstdint -include shim/windows.h \
   test.cpp $S/disk/*.cpp $S/boot/android_boot.cpp $S/boot/mptable.cpp $S/devices/pit.cpp $S/devices/ioapic.cpp \
-  $S/devices/virtio_pci.cpp $S/devices/virtio_blk.cpp $S/devices/virtio_console.cpp $S/devices/virtio_net.cpp $S/devices/virtio_vsock.cpp $S/host/oemlock.cpp $S/boot/ramdisk_inspect.cpp $S/net/user_net.cpp $S/devices/pci.cpp $S/vmm/guest_memory.cpp \
+  $S/devices/virtio_pci.cpp $S/devices/virtio_blk.cpp $S/devices/virtio_console.cpp $S/devices/virtio_net.cpp $S/devices/virtio_vsock.cpp $S/host/oemlock.cpp $S/ui/keymapper.cpp $S/boot/ramdisk_inspect.cpp $S/net/user_net.cpp $S/devices/pci.cpp $S/vmm/guest_memory.cpp \
   $S/common/log.cpp -o test -lpthread
 rm -rf imgs/cache
 ASAN_OPTIONS=detect_leaks=0 ./test

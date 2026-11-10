@@ -7,7 +7,6 @@
 //   trace.log    - host-side VMM diagnostics
 #include <windows.h>
 #include <shellapi.h>
-#include <commdlg.h>
 #include <windowsx.h>
 
 #include <atomic>
@@ -44,7 +43,9 @@
 #include "host/vsock_tcp_bridge.h"
 #include "ui/dx12_display.h"
 #include "ui/boot_stage.h"
+#include "ui/gdiplus_util.h"
 #include "ui/keymap.h"
+#include "ui/keymapper.h"
 #include "ui/serial_console.h"
 #include "ui/shell_ui.h"
 #include "vmm/guest_memory.h"
@@ -98,6 +99,7 @@ struct Settings {
     bool network = true;
     bool boot_splash = true;
     bool first_boot_setup = true;
+    bool adb_bridge = false;
     std::wstring setup_script = L"config\\aetheron_setup.sh";
     std::string cmdline_extra = "console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 8250.nr_uarts=1";
 };
@@ -118,7 +120,6 @@ struct App {
     VirtioNet* net = nullptr;
     VirtioVsock* vsock = nullptr;
     std::unique_ptr<VsockTcpBridge> adb_bridge;
-    std::atomic<bool> adb_busy{false};
     std::unique_ptr<OemLockResponder> oemlock;
     std::unique_ptr<PortDevice> reset_ports;
     std::thread shutdown_thread;
@@ -128,6 +129,11 @@ struct App {
     uint32_t view_w = 0, view_h = 0;
     std::atomic<bool> reveal{false};
     ShellUi ui;
+    KeyMapper keymap;
+    bool touch_active[KeyMapper::kSlots] = {};  // fingers currently down on the guest touch screen
+    int touch_next_id = 1;
+    int capture = 0;                            // Capture: what the next click / key press is for
+    float capture_x = 0, capture_y = 0;
     UiSettings pending;  // what the settings page shows (saved values)
     HMENU popup = nullptr;
     bool fullscreen = false;
@@ -221,6 +227,7 @@ void LoadSettings() {
         else if (k == "boot_splash") g.s.boot_splash = (v == "on" || v == "1" || v == "true");
         else if (k == "first_boot_setup") g.s.first_boot_setup = (v == "on" || v == "1" || v == "true");
         else if (k == "setup_script") g.s.setup_script = Widen(v);
+        else if (k == "adb_bridge") g.s.adb_bridge = (v == "on" || v == "1" || v == "true");
     }
     g.s.images_dir = Resolve(g.s.base_dir, g.s.images_dir);
     g.s.disk_config = Resolve(g.s.base_dir, g.s.disk_config);
@@ -547,8 +554,10 @@ bool SetupAndStart() {
     g.vm.Start([](const std::string& reason) { SetStatus("guest stopped: " + reason); });
     if (g.net) g.net->StartNetwork();
     // adbd in Cuttlefish listens on vsock port 5555; 6520 is Cuttlefish's usual host port for it.
-    g.adb_bridge = std::make_unique<VsockTcpBridge>(g.vsock, 6520, 5555);
-    g.adb_bridge->Start();
+    if (g.s.adb_bridge) {
+        g.adb_bridge = std::make_unique<VsockTcpBridge>(g.vsock, 6520, 5555);
+        g.adb_bridge->Start();
+    }
     SetStatus("guest running: waiting for kernel output");
     return true;
 }
@@ -590,22 +599,6 @@ void CollectLogs(HWND hwnd) {
     Log("logs collected into %ls", target.c_str());
 }
 
-void SendTouch(HWND hwnd, int x, int y, bool down_change, bool down) {
-    if (!g.touch) return;
-    RECT rc;
-    GetClientRect(hwnd, &rc);
-    if (rc.right <= 0 || rc.bottom <= 0) return;
-    int gx = int(int64_t(x) * g.s.width / rc.right), gy = int(int64_t(y) * g.s.height / rc.bottom);
-    gx = gx < 0 ? 0 : gx >= int(g.s.width) ? int(g.s.width) - 1 : gx;
-    gy = gy < 0 ? 0 : gy >= int(g.s.height) ? int(g.s.height) - 1 : gy;
-    std::vector<InputEvent> ev;
-    ev.push_back({3, 0, gx});  // EV_ABS ABS_X
-    ev.push_back({3, 1, gy});  // EV_ABS ABS_Y
-    if (down_change) ev.push_back({1, 0x14A, down ? 1 : 0});  // BTN_TOUCH
-    ev.push_back({0, 0, 0});   // SYN_REPORT
-    g.touch->Send(ev.data(), ev.size());
-}
-
 // Asks Android to save its data and power off before the VM is torn down, so
 // the data partition is unmounted cleanly. Closing again skips the wait.
 void GracefulShutdown(HWND hwnd) {
@@ -636,118 +629,85 @@ void RequestWipe(HWND hwnd) {
                 L"Aetheron", MB_OK | MB_ICONINFORMATION);
 }
 
-// ---- Windows -> Android channel: adb over the vsock bridge ----
-const wchar_t kAdbSerial[] = L"127.0.0.1:6520";
+// ---- touch and key mapping ----
+enum Capture { kCapNone = 0, kCapTapSpot, kCapTapKey, kCapDpadSpot };
 
-std::wstring FindAdb() {
-    for (const wchar_t* rel : {L"\\tools\\adb.exe", L"\\platform-tools\\adb.exe", L"\\adb.exe"})
-        if (FileExists(g.s.base_dir + rel)) return g.s.base_dir + rel;
-    wchar_t buf[MAX_PATH];
-    if (SearchPathW(nullptr, L"adb.exe", nullptr, MAX_PATH, buf, nullptr)) return buf;
-    return L"";
-}
-
-// Runs a console program without a window. Returns its exit code (-1 if it
-// could not run) and, when `output` is given, everything it printed.
-int RunHidden(std::wstring cmd, std::string* output, DWORD timeout_ms) {
-    SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
-    HANDLE rd = nullptr, wr = nullptr;
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-    if (output) {
-        if (!CreatePipe(&rd, &wr, &sa, 0)) return -1;
-        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdOutput = wr;
-        si.hStdError = wr;
-    }
-    PROCESS_INFORMATION pi = {};
-    const BOOL started = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, output != nullptr, CREATE_NO_WINDOW,
-                                        nullptr, nullptr, &si, &pi);
-    if (wr) CloseHandle(wr);
-    if (!started) {
-        if (rd) CloseHandle(rd);
-        return -1;
-    }
-    if (output) {
-        char buf[4096];
-        DWORD n = 0;
-        while (ReadFile(rd, buf, sizeof(buf), &n, nullptr) && n) output->append(buf, n);
-        CloseHandle(rd);
-    }
-    DWORD code = DWORD(-1);
-    if (WaitForSingleObject(pi.hProcess, timeout_ms) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
-    else TerminateProcess(pi.hProcess, 1);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    return int(code);
-}
-
-std::string LastLine(const std::string& text) {
-    std::istringstream ss(text);
-    std::string line, last;
-    while (std::getline(ss, line)) {
-        line = Trim(line);
-        if (!line.empty()) last = line;
-    }
-    return last;
-}
-
-// Installs .apk files and copies any other file into Android's Download
-// folder, using adb through the vsock bridge. Runs in the background.
-void AdbTransfer(std::vector<std::wstring> files) {
-    if (files.empty()) return;
-    if (g.adb_busy.exchange(true)) {
-        SetStatus("still busy with the previous install or copy");
-        return;
-    }
-    std::thread([files] {
-        struct Done {
-            ~Done() { g.adb_busy = false; }
-        } done;
-        const std::wstring adb = FindAdb();
-        if (adb.empty()) {
-            SetStatus("adb.exe not found - put Android platform-tools (adb.exe and its DLLs) into the tools folder "
-                      "next to Aetheron.exe");
-            return;
+// One finger on the guest touch screen (Linux multi-touch protocol B).
+// x and y are fractions of the screen; down on a held slot moves the finger.
+void TouchSlot(int slot, bool down, float nx, float ny) {
+    if (!g.touch || slot < 0 || slot >= KeyMapper::kSlots) return;
+    int active = 0;
+    for (bool a : g.touch_active) active += a ? 1 : 0;
+    std::vector<InputEvent> ev;
+    ev.push_back({3, 0x2F, slot});  // ABS_MT_SLOT
+    if (down) {
+        const bool first = !g.touch_active[slot];
+        if (first) {
+            g.touch_active[slot] = true;
+            ev.push_back({3, 0x39, g.touch_next_id});  // ABS_MT_TRACKING_ID: a new contact
+            g.touch_next_id = g.touch_next_id % 60000 + 1;
         }
-        const std::wstring q = L"\"" + adb + L"\" ";
-        // Started without pipes: the adb server it leaves running must not inherit them.
-        RunHidden(q + L"start-server", nullptr, 30000);
-        std::string out;
-        RunHidden(q + L"connect " + kAdbSerial, &out, 30000);
-        if (out.find("connected") == std::string::npos) {
-            SetStatus("adb cannot reach Android yet (" + LastLine(out) + ") - try again once Android has booted");
-            return;
-        }
-        for (const std::wstring& file : files) {
-            const std::string name = Narrow(file.substr(file.find_last_of(L"\\/") + 1));
-            const bool apk = file.size() > 4 && _wcsicmp(file.c_str() + file.size() - 4, L".apk") == 0;
-            SetStatus((apk ? "installing " : "copying ") + name + " ...");
-            out.clear();
-            const std::wstring cmd = q + L"-s " + kAdbSerial + (apk ? L" install -r \"" : L" push \"") + file + L"\"" +
-                                     (apk ? L"" : L" /sdcard/Download/");
-            const int code = RunHidden(cmd, &out, INFINITE);
-            const bool ok = code == 0 && (!apk || out.find("Success") != std::string::npos);
-            Log("adb: %s %s: exit %d: %s", apk ? "install" : "push", name.c_str(), code, LastLine(out).c_str());
-            if (ok) SetStatus((apk ? "installed " : "copied to Android's Download folder: ") + name);
-            else SetStatus((apk ? "install failed: " : "copy failed: ") + name + " - " + LastLine(out));
-            if (!ok) return;
-        }
-    }).detach();
+        nx = nx < 0 ? 0 : nx > 1 ? 1 : nx;
+        ny = ny < 0 ? 0 : ny > 1 ? 1 : ny;
+        ev.push_back({3, 0x35, int(nx * (g.s.width - 1) + 0.5f)});   // ABS_MT_POSITION_X
+        ev.push_back({3, 0x36, int(ny * (g.s.height - 1) + 0.5f)});  // ABS_MT_POSITION_Y
+        if (first && active == 0) ev.push_back({1, 0x14A, 1});       // BTN_TOUCH
+    } else {
+        if (!g.touch_active[slot]) return;
+        g.touch_active[slot] = false;
+        ev.push_back({3, 0x39, -1});  // contact lifted
+        if (active == 1) ev.push_back({1, 0x14A, 0});
+    }
+    ev.push_back({0, 0, 0});  // SYN_REPORT
+    g.touch->Send(ev.data(), ev.size());
 }
 
-void PickAndInstall(HWND hwnd) {
-    wchar_t buf[2048] = L"";
-    OPENFILENAMEW o = {};
-    o.lStructSize = sizeof(o);
-    o.hwndOwner = hwnd;
-    o.lpstrFilter = L"Android apps (*.apk)\0*.apk\0All files\0*.*\0";
-    o.lpstrFile = buf;
-    o.nMaxFile = 2048;
-    o.lpstrTitle = L"Install an app or copy a file into Android";
-    o.Flags = OFN_FILEMUSTEXIST | OFN_EXPLORER | OFN_HIDEREADONLY;
-    if (GetOpenFileNameW(&o)) AdbTransfer({buf});
+// The mouse is finger 0.
+void SendTouch(HWND hwnd, int x, int y, bool, bool down) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    if (rc.right <= 0 || rc.bottom <= 0) return;
+    TouchSlot(KeyMapper::kMouseSlot, down, float(x) / rc.right, float(y) / rc.bottom);
+}
+
+// Shows the key mapping in the settings page and as hints on the Android
+// screen; with `save`, also writes config\aetheron_keymap.txt.
+void PublishKeymap(bool save) {
+    if (save) {
+        const std::string text = g.keymap.Serialize();
+        FILE* f = _wfopen((g.s.base_dir + L"\\config\\aetheron_keymap.txt").c_str(), L"wb");
+        if (f) {
+            fwrite(text.data(), 1, text.size(), f);
+            fclose(f);
+        }
+    }
+    UiControls c;
+    c.enabled = g.keymap.enabled;
+    c.hints = g.keymap.hints;
+    c.dpad = g.keymap.dpad.enabled;
+    std::vector<OverlayMarker> markers;
+    for (const KeyMapper::Tap& t : g.keymap.taps) {
+        const std::wstring name = Widen(KeyMapper::KeyName(t.vk));
+        c.taps.push_back(name + L"   presses the spot at " + std::to_wstring(int(t.x * 100 + 0.5f)) + L"%, " +
+                         std::to_wstring(int(t.y * 100 + 0.5f)) + L"%");
+        markers.push_back({t.x, t.y, 0.036f, name});
+    }
+    if (g.keymap.dpad.enabled) {
+        const KeyMapper::Dpad& d = g.keymap.dpad;
+        markers.push_back({d.x, d.y, d.radius,
+                           Widen(KeyMapper::KeyName(d.up) + " " + KeyMapper::KeyName(d.left) + " " +
+                                 KeyMapper::KeyName(d.down) + " " + KeyMapper::KeyName(d.right))});
+    }
+    if (!g.keymap.enabled || !g.keymap.hints) markers.clear();
+    g.ui.SetControls(c);
+    g.display.SetOverlay(std::move(markers));
+}
+
+void LoadKeymap() {
+    std::string text;
+    if (ReadTextFile(g.s.base_dir + L"\\config\\aetheron_keymap.txt", &text)) g.keymap.Parse(text);
+    g.keymap.aspect = float(g.s.width) / float(g.s.height ? g.s.height : 1);
+    PublishKeymap(false);
 }
 
 // Writes the settings page's values into aetheron.ini, keeping comments and
@@ -866,6 +826,16 @@ void ToggleFullscreen() {
     LayoutView();
 }
 
+// The next click on the Android screen (and, for a key, the next key press)
+// defines a mapping instead of going to Android.
+void BeginCapture(int what, const char* prompt) {
+    void ToggleSettings();
+    if (g.ui.settings_open()) ToggleSettings();
+    g.keymap.ReleaseAll(TouchSlot);
+    g.capture = what;
+    SetStatus(prompt);
+}
+
 // Opens or closes the settings page; the Android screen is hidden meanwhile.
 void ToggleSettings() {
     if (g.ui.settings_open()) g.ui.CloseSettings();
@@ -922,6 +892,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             case WM_ERASEBKGND:
                 return 1;
+            case WM_TIMER:
+                if (wp == ShellUi::kAnimTimer) {
+                    g.ui.Tick();
+                    return 0;
+                }
+                break;
+            case WM_KILLFOCUS:
+                g.keymap.ReleaseAll(TouchSlot);  // no stuck fingers when the window loses the keyboard
+                break;
             case WM_PAINT: {
                 PAINTSTRUCT ps;
                 HDC dc = BeginPaint(hwnd, &ps);
@@ -964,18 +943,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             break;
-        case WM_DROPFILES: {
-            HDROP drop = HDROP(wp);
-            std::vector<std::wstring> files;
-            const UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
-            for (UINT i = 0; i < n; ++i) {
-                wchar_t path[1024];
-                if (DragQueryFileW(drop, i, path, 1024)) files.push_back(path);
-            }
-            DragFinish(drop);
-            AdbTransfer(files);
-            return 0;
-        }
         case WM_APP_LAYOUT:
             g.view_w = uint32_t(wp);
             g.view_h = uint32_t(lp);
@@ -983,6 +950,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_LBUTTONDOWN:
             if (hwnd != g.view) return 0;  // the bars around the screen are not part of it
+            if (g.capture == kCapTapSpot || g.capture == kCapDpadSpot) {
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+                if (rc.right <= 0 || rc.bottom <= 0) return 0;
+                const float nx = float(GET_X_LPARAM(lp)) / rc.right, ny = float(GET_Y_LPARAM(lp)) / rc.bottom;
+                if (g.capture == kCapTapSpot) {
+                    g.capture_x = nx;
+                    g.capture_y = ny;
+                    g.capture = kCapTapKey;
+                    SetStatus("now press the key for that spot (Esc cancels)");
+                } else {
+                    g.keymap.dpad.x = nx;
+                    g.keymap.dpad.y = ny;
+                    g.keymap.dpad.enabled = true;
+                    g.capture = kCapNone;
+                    PublishKeymap(true);
+                    SetStatus("joystick placed - W A S D now drag a finger around that spot");
+                }
+                return 0;
+            }
             SetCapture(hwnd);
             g.touching = true;
             SendTouch(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), true, true);
@@ -1006,6 +993,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (g.ui.settings_open()) break;  // typing must not reach Android behind the settings page
+            {
+                const bool key_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+                if (g.capture != kCapNone) {
+                    if (key_down && wp == VK_ESCAPE) {
+                        g.capture = kCapNone;
+                        SetStatus("key mapping cancelled");
+                    } else if (key_down && g.capture == kCapTapKey) {
+                        g.keymap.SetTap(uint32_t(wp), g.capture_x, g.capture_y);
+                        g.capture = kCapNone;
+                        PublishKeymap(true);
+                        SetStatus(KeyMapper::KeyName(uint32_t(wp)) + " now presses that spot");
+                    }
+                    return 0;
+                }
+                if (g.keymap.OnKey(uint32_t(wp), key_down, TouchSlot)) return 0;  // mapped keys act as fingers
+            }
             if (!g.keyboard) break;
             bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
             bool repeat = down && (lp & (1 << 30));
@@ -1016,7 +1019,38 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_COMMAND:
+            if (LOWORD(wp) >= kUiKmRemove && LOWORD(wp) < kUiKmRemove + 100) {
+                const size_t i = LOWORD(wp) - kUiKmRemove;
+                g.keymap.ReleaseAll(TouchSlot);
+                if (i < g.keymap.taps.size()) g.keymap.taps.erase(g.keymap.taps.begin() + i);
+                PublishKeymap(true);
+                return 0;
+            }
             switch (LOWORD(wp)) {
+                case kUiControls:
+                    g.ui.OpenSettings(g.pending, ShellUi::kPageControls);
+                    ShowWindow(g.view, SW_HIDE);
+                    return 0;
+                case kUiKmEnable:
+                    g.keymap.ReleaseAll(TouchSlot);
+                    g.keymap.enabled = !g.keymap.enabled;
+                    PublishKeymap(true);
+                    return 0;
+                case kUiKmHints:
+                    g.keymap.hints = !g.keymap.hints;
+                    PublishKeymap(true);
+                    return 0;
+                case kUiKmDpad:
+                    g.keymap.ReleaseAll(TouchSlot);
+                    g.keymap.dpad.enabled = !g.keymap.dpad.enabled;
+                    PublishKeymap(true);
+                    return 0;
+                case kUiKmPlaceDpad:
+                    BeginCapture(kCapDpadSpot, "click the spot on the Android screen where the game's joystick is");
+                    return 0;
+                case kUiKmAdd:
+                    BeginCapture(kCapTapSpot, "click the spot on the Android screen that the key should press");
+                    return 0;
                 case kCmdCollectLogs: CollectLogs(hwnd); return 0;
                 case kCmdShowConsole: g.console.Show(); return 0;
                 case kCmdOpenFolder:
@@ -1027,7 +1061,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case kUiHome: TapKey(172); return 0;     // KEY_HOMEPAGE
                 case kUiRecents: TapKey(580); return 0;  // KEY_APPSELECT
                 case kUiFullscreen: ToggleFullscreen(); return 0;
-                case kUiInstallApk: PickAndInstall(hwnd); return 0;
                 case kUiScreenshot: SaveScreenshot(); return 0;
                 case kUiSettings: ToggleSettings(); return 0;
                 case kUiSaveSettings:
@@ -1081,7 +1114,6 @@ LRESULT CALLBACK ViewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return WndProc(hwnd, msg, wp, lp);
         case WM_MOUSEMOVE:
         case WM_LBUTTONUP:
-        case WM_DROPFILES:
             return WndProc(hwnd, msg, wp, lp);
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -1090,6 +1122,7 @@ LRESULT CALLBACK ViewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+    EnsureGdiplus();
     LoadSettings();
     SetCurrentDirectoryW(g.s.base_dir.c_str());
     {
@@ -1137,6 +1170,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                              nullptr, inst, nullptr);
     if (!g.hwnd) return 1;
     g.ui.Attach(g.hwnd);
+    LoadKeymap();
     g.pending.ram_mb = g.s.ram_mb;
     g.pending.cpus = g.s.cpus;
     g.pending.width = g.s.width;
@@ -1161,8 +1195,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g.view = CreateWindowExW(0, vc.lpszClassName, L"", WS_CHILD | WS_VISIBLE, 0, 0, 16, 16, g.hwnd, nullptr, inst, nullptr);
     if (!g.view) return 1;
     LayoutView();
-    DragAcceptFiles(g.hwnd, TRUE);
-    DragAcceptFiles(g.view, TRUE);
     g.display.SetLayoutNotify(g.hwnd, WM_APP_LAYOUT);
     UpdateSplash("starting");
     if (!g.display.Initialize(g.view, g.s.width, g.s.height, &err)) {

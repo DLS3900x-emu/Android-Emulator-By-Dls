@@ -12,10 +12,18 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "../devices/virtio_gpu.h"
 
 namespace Aetheron {
+
+// A labelled circle drawn over the Android picture (key-mapping hints).
+struct OverlayMarker {
+    float x, y;     // centre, fractions of the screen
+    float radius;   // fraction of the screen height
+    std::wstring label;
+};
 
 class Dx12Display {
 public:
@@ -26,6 +34,7 @@ public:
     // Boot screen with a progress bar; `percent` and `text` come from real boot stages.
     void SetSplash(bool show, int percent, const std::wstring& text);
     // Posts `msg` (wParam = width, lParam = height) to `target` when the guest resolution changes.
+    void SetOverlay(std::vector<OverlayMarker> markers);
     void SetLayoutNotify(HWND target, UINT msg) {
         notify_hwnd_ = target;
         notify_msg_ = msg;
@@ -33,6 +42,8 @@ public:
 
 private:
     void DrawSplash(uint8_t* dst);
+    void BuildOverlay();
+    void BlendOverlay(uint8_t* dst);
     bool ResizeTo(uint32_t w, uint32_t h);
     void RenderLoop();
     bool PresentFrame();
@@ -44,6 +55,12 @@ private:
     ScanoutBuffer* scanout_ = nullptr;
     uint64_t last_frame_ = ~0ULL;
     uint32_t idle_frames_ = 0;
+    std::vector<OverlayMarker> overlay_;              // guarded by splash_mutex_
+    std::atomic<uint64_t> overlay_version_{0};
+    uint64_t overlay_built_ = ~0ULL;
+    uint32_t overlay_w_ = 0, overlay_h_ = 0;
+    std::vector<uint8_t> overlay_disc_, overlay_text_;  // coverage masks, width*height
+    std::vector<RECT> overlay_rects_;                 // where the masks are not empty
     HWND notify_hwnd_ = nullptr;
     UINT notify_msg_ = 0;
     std::mutex splash_mutex_;

@@ -1,25 +1,31 @@
 #include "shell_ui.h"
 
 #include <algorithm>
+#include <cmath>
 #include <iterator>
+
+#include "gdiplus_util.h"
 
 namespace Aetheron {
 
 namespace {
 
 // Neutral gray theme.
-constexpr COLORREF kBar = RGB(32, 33, 36), kContent = RGB(17, 17, 19), kPanel = RGB(24, 25, 28);
-constexpr COLORREF kHover = RGB(52, 54, 58), kPress = RGB(72, 74, 80), kControl = RGB(40, 42, 46);
-constexpr COLORREF kLine = RGB(48, 50, 54), kText = RGB(232, 234, 237), kDim = RGB(150, 154, 161);
-constexpr COLORREF kIcon = RGB(198, 201, 206), kCloseHover = RGB(196, 43, 28);
+constexpr COLORREF kBar = RGB(30, 31, 34), kContent = RGB(15, 15, 17), kPanel = RGB(27, 28, 32);
+constexpr COLORREF kHover = RGB(50, 52, 57), kPress = RGB(66, 68, 74), kControl = RGB(40, 42, 47);
+constexpr COLORREF kLine = RGB(42, 44, 49), kText = RGB(234, 236, 240), kDim = RGB(148, 152, 160);
+constexpr COLORREF kIcon = RGB(196, 199, 205), kCloseHover = RGB(196, 43, 28);
+constexpr COLORREF kPrimary = RGB(226, 228, 233), kPrimaryHover = RGB(205, 208, 214), kOnPrimary = RGB(24, 25, 28);
+constexpr COLORREF kTrackOff = RGB(58, 60, 66), kKnobOff = RGB(170, 174, 182);
 
 // Glyphs of the Windows icon font "Segoe MDL2 Assets".
 constexpr wchar_t kGlyphMenu = 0xE700, kGlyphSettings = 0xE713, kGlyphBack = 0xE72B, kGlyphHome = 0xE80F,
                   kGlyphRecents = 0xE7C4, kGlyphFullscreen = 0xE740, kGlyphCamera = 0xE722, kGlyphConsole = 0xE756,
-                  kGlyphFolder = 0xE8B7, kGlyphLogs = 0xE8A5, kGlyphInstall = 0xE896, kGlyphMinimize = 0xE921, kGlyphMaximize = 0xE922,
-                  kGlyphRestore = 0xE923, kGlyphClose = 0xE8BB, kGlyphPrev = 0xE76B, kGlyphNext = 0xE76C;
+                  kGlyphFolder = 0xE8B7, kGlyphLogs = 0xE8A5, kGlyphKeyboard = 0xE765, kGlyphMinimize = 0xE921,
+                  kGlyphMaximize = 0xE922, kGlyphRestore = 0xE923, kGlyphClose = 0xE8BB, kGlyphPrev = 0xE76B,
+                  kGlyphNext = 0xE76C;
 
-const wchar_t* const kPages[] = {L"Performance", L"Display", L"Network", L"Android", L"Tools", L"About"};
+const wchar_t* const kPages[] = {L"Performance", L"Display", L"Controls", L"Network", L"Android", L"Tools", L"About"};
 
 struct Resolution {
     uint32_t w, h;
@@ -37,6 +43,13 @@ size_t IndexOf(const T (&options)[N], Eq eq) {
 }
 
 bool In(const RECT& r, POINT p) { return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom; }
+
+COLORREF Mix(COLORREF a, COLORREF b, float t) {
+    auto ch = [t](int x, int y) { return int(x + (y - x) * t + 0.5f); };
+    return RGB(ch(GetRValue(a), GetRValue(b)), ch(GetGValue(a), GetGValue(b)), ch(GetBValue(a), GetBValue(b)));
+}
+
+RECT Inset(const RECT& r, int dx, int dy) { return RECT{r.left + dx, r.top + dy, r.right - dx, r.bottom - dy}; }
 
 }  // namespace
 
@@ -70,14 +83,22 @@ void ShellUi::SetStatus(const std::wstring& text) {
     Redraw();
 }
 
-void ShellUi::OpenSettings(const UiSettings& current) {
+void ShellUi::SetControls(const UiControls& c) {
+    controls_ = c;
+    Redraw();
+}
+
+void ShellUi::OpenSettings(const UiSettings& current, int page) {
     edit_ = saved_ = current;
+    if (page >= 0 && page < int(std::size(kPages))) page_ = page;
     settings_open_ = true;
+    anim_.clear();
     Redraw();
 }
 
 void ShellUi::CloseSettings() {
     settings_open_ = false;
+    anim_.clear();
     Redraw();
 }
 
@@ -148,7 +169,7 @@ void ShellUi::EnsureFonts() {
     font_ui_ = make(14, FW_NORMAL, L"Segoe UI");
     font_small_ = make(12, FW_NORMAL, L"Segoe UI");
     font_bold_ = make(14, FW_SEMIBOLD, L"Segoe UI");
-    font_big_ = make(24, FW_SEMIBOLD, L"Segoe UI");
+    font_big_ = make(22, FW_SEMIBOLD, L"Segoe UI");
     font_icon_ = make(15, FW_NORMAL, L"Segoe MDL2 Assets");
 }
 
@@ -169,16 +190,35 @@ void ShellUi::AddHot(const RECT& r, int key, std::function<void()> act, const st
     hots_.push_back({r, key, std::move(act), hint});
 }
 
-COLORREF ShellUi::StateColor(int key, COLORREF normal) const {
-    if (key == pressed_ && key == hover_) return kPress;
-    if (key == hover_) return kHover;
+COLORREF ShellUi::StateColor(int key, COLORREF normal, COLORREF hover, COLORREF press) const {
+    if (key == pressed_ && key == hover_) return press;
+    if (key == hover_) return hover;
     return normal;
+}
+
+// Eases a toggle's knob towards its state; keeps the repaint timer running meanwhile.
+float ShellUi::Animate(int key, bool on) {
+    const float target = on ? 1.0f : 0.0f;
+    auto it = anim_.find(key);
+    if (it == anim_.end()) {
+        anim_[key] = target;
+        return target;
+    }
+    const float d = target - it->second;
+    if (std::fabs(d) < 0.02f) {
+        it->second = target;
+    } else {
+        it->second += d * 0.34f;
+        animating_ = true;
+    }
+    return it->second;
 }
 
 void ShellUi::IconButton(HDC dc, const RECT& r, int key, wchar_t glyph, const std::wstring& hint, UINT cmd,
                          bool danger) {
     const bool hot = key == hover_;
-    Fill(dc, r, danger && hot ? kCloseHover : StateColor(key, kBar));
+    if (hot || key == pressed_)
+        FillRound(dc, Inset(r, 5, 4), 8, danger ? kCloseHover : StateColor(key, kBar, kHover, kPress));
     Text(dc, r, std::wstring(1, glyph), font_icon_, hot ? kText : kIcon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     AddHot(r, key, [this, cmd] { Command(cmd); }, hint);
 }
@@ -187,14 +227,13 @@ void ShellUi::DrawBars(HDC dc, const RECT& client) {
     const int cw = client.right, ch = client.bottom;
 
     // ---- top bar ----
-    RECT top = {0, 0, cw, kTopH};
-    Fill(dc, top, kBar);
+    Fill(dc, RECT{0, 0, cw, kTopH}, kBar);
     const std::wstring name = L"AETHERON";
     SIZE sz = {0, 0};
     HGDIOBJ old = SelectObject(dc, font_bold_);
     GetTextExtentPoint32W(dc, name.c_str(), int(name.size()), &sz);
     SelectObject(dc, old);
-    int x = 14;
+    int x = 16;
     Text(dc, RECT{x, 0, x + sz.cx, kTopH}, name, font_bold_, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     x += sz.cx + 12;
     const int nav_w = 40;
@@ -215,17 +254,15 @@ void ShellUi::DrawBars(HDC dc, const RECT& client) {
     IconButton(dc, RECT{rx + 3 * win_w, 0, cw, kTopH}, 7, kGlyphClose, L"Shut Android down and close", kUiExit, true);
 
     // ---- sidebar ----
-    RECT side = {cw - kSideW, kTopH, cw, ch};
-    Fill(dc, side, kBar);
-    const int bh = 40;
+    Fill(dc, RECT{cw - kSideW, kTopH, cw, ch}, kBar);
+    const int bh = 42;
     int y = kTopH + 4;
     auto side_btn = [&](int key, wchar_t glyph, const wchar_t* hint, UINT cmd) {
         IconButton(dc, RECT{cw - kSideW, y, cw, y + bh}, key, glyph, hint, cmd);
         y += bh;
     };
     side_btn(10, kGlyphFullscreen, L"Full screen (F11)", kUiFullscreen);
-    side_btn(15, kGlyphInstall, L"Install an app (.apk) or copy a file into Android - or drop it on the window",
-             kUiInstallApk);
+    side_btn(15, kGlyphKeyboard, L"Key mapping: play with the keyboard", kUiControls);
     side_btn(11, kGlyphCamera, L"Save a screenshot", kUiScreenshot);
     side_btn(12, kGlyphConsole, L"Android console", kUiShowConsole);
     side_btn(13, kGlyphLogs, L"Collect logs into a zip", kUiCollectLogs);
@@ -250,71 +287,76 @@ void ShellUi::DrawBars(HDC dc, const RECT& client) {
 }
 
 void ShellUi::DrawSettings(HDC dc, const RECT& area) {
-    Fill(dc, area, kPanel);
     const int aw = area.right - area.left, ah = area.bottom - area.top;
-    const int pw = std::min(820, std::max(aw - 60, 300));
-    const int px = area.left + (aw - pw) / 2, py = area.top + std::max(20, (ah - 520) / 3);
+    const int cw = std::min(880, std::max(aw - 40, 320)), chh = std::min(620, std::max(ah - 40, 240));
+    const RECT card = {area.left + (aw - cw) / 2, area.top + (ah - chh) / 2, area.left + (aw - cw) / 2 + cw,
+                       area.top + (ah - chh) / 2 + chh};
+    FillRound(dc, card, 14, kPanel);
+    const int pad = 28, px = card.left + pad, py = card.top + 22;
 
-    Text(dc, RECT{px, py, px + pw, py + 40}, L"Settings", font_big_, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    Text(dc, RECT{px, py, card.right - 80, py + 36}, L"Settings", font_big_, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     {
-        RECT r = {area.right - 56, area.top + 12, area.right - 16, area.top + 52};
-        Fill(dc, r, StateColor(100, kPanel));
-        Text(dc, r, std::wstring(1, kGlyphClose), font_icon_, kIcon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        const RECT r = {card.right - 54, card.top + 18, card.right - 18, card.top + 54};
+        if (hover_ == 100) FillRound(dc, r, 10, StateColor(100, kPanel, kHover, kPress));
+        Text(dc, r, std::wstring(1, kGlyphClose), font_icon_, hover_ == 100 ? kText : kIcon,
+             DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         AddHot(r, 100, [this] { Command(kUiSettings); }, L"Close settings");
     }
 
     // Page list.
-    const int list_w = 170, top = py + 64;
+    const int list_w = 172, top = py + 58;
     for (int i = 0; i < int(std::size(kPages)); ++i) {
-        RECT r = {px, top + i * 34, px + list_w - 16, top + i * 34 + 30};
+        const RECT r = {px - 10, top + i * 40, px + list_w - 22, top + i * 40 + 34};
         const bool sel = i == page_;
-        Text(dc, r, kPages[i], sel ? font_bold_ : font_ui_, sel || hover_ == 110 + i ? kText : kDim,
+        if (sel) FillRound(dc, r, 9, kControl);
+        else if (hover_ == 110 + i) FillRound(dc, r, 9, RGB(34, 35, 40));
+        Text(dc, RECT{r.left + 12, r.top, r.right, r.bottom}, kPages[i], sel ? font_bold_ : font_ui_, sel ? kText : kDim,
              DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        if (sel) Fill(dc, RECT{r.left, r.bottom - 2, r.left + 28, r.bottom}, kText);
         AddHot(r, 110 + i, [this, i] {
             page_ = i;
+            anim_.clear();
             Redraw();
         }, L"");
     }
-    Fill(dc, RECT{px + list_w, top, px + list_w + 1, top + 6 * 34 + 60}, kLine);
 
     // Rows of the selected page.
-    const int rx = px + list_w + 28, rw = pw - list_w - 28, ctl_w = 210, ctl_h = 32, row_h = 56;
-    int y = top;
+    const int rx = px + list_w + 8, rw = card.right - pad - rx, ctl_w = 204, ctl_h = 34, row_h = 54;
+    const int bottom = card.bottom - 22;
+    int y = top - 6;
     int key = 200;
-    auto label = [&](const std::wstring& s) {
-        Text(dc, RECT{rx, y, rx + rw - ctl_w - 16, y + row_h}, s, font_ui_, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    auto label = [&](const std::wstring& s, int h) {
+        Text(dc, RECT{rx, y, rx + rw - ctl_w - 16, y + h}, s, font_ui_, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     };
     auto end_row = [&](int h) {
         y += h;
         Fill(dc, RECT{rx, y - 1, rx + rw, y}, kLine);
     };
+    auto chevron = [&](const RECT& r, wchar_t glyph, std::function<void()> act) {
+        if (hover_ == key) FillCircle(dc, (r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f, 13, StateColor(key, kControl, kHover, kPress));
+        Text(dc, r, std::wstring(1, glyph), font_icon_, hover_ == key ? kText : kIcon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        AddHot(r, key++, [this, act] { act(); Redraw(); }, L"");
+    };
     auto choice = [&](const std::wstring& name, const std::wstring& value, std::function<void()> prev,
                       std::function<void()> next) {
-        label(name);
+        label(name, row_h);
         const RECT box = {rx + rw - ctl_w, y + (row_h - ctl_h) / 2, rx + rw, y + (row_h - ctl_h) / 2 + ctl_h};
-        Fill(dc, box, kControl);
-        const RECT l = {box.left, box.top, box.left + ctl_h, box.bottom}, r = {box.right - ctl_h, box.top, box.right, box.bottom};
-        Fill(dc, l, StateColor(key, kControl));
-        Text(dc, l, std::wstring(1, kGlyphPrev), font_icon_, kIcon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        AddHot(l, key++, [this, prev] { prev(); Redraw(); }, L"");
-        Fill(dc, r, StateColor(key, kControl));
-        Text(dc, r, std::wstring(1, kGlyphNext), font_icon_, kIcon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        AddHot(r, key++, [this, next] { next(); Redraw(); }, L"");
-        Text(dc, RECT{l.right, box.top, r.left, box.bottom}, value, font_ui_, kText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        FillRound(dc, box, 9, kControl);
+        chevron(RECT{box.left + 2, box.top, box.left + 2 + ctl_h, box.bottom}, kGlyphPrev, prev);
+        chevron(RECT{box.right - 2 - ctl_h, box.top, box.right - 2, box.bottom}, kGlyphNext, next);
+        Text(dc, RECT{box.left + ctl_h, box.top, box.right - ctl_h, box.bottom}, value, font_ui_, kText,
+             DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         end_row(row_h);
     };
-    auto toggle = [&](const std::wstring& name, bool* value) {
-        label(name);
-        const int tw = 40, th = 20;
+    auto toggle = [&](const std::wstring& name, bool value, std::function<void()> act) {
+        label(name, row_h);
+        const int tw = 44, th = 24;
         const RECT t = {rx + rw - tw, y + (row_h - th) / 2, rx + rw, y + (row_h - th) / 2 + th};
-        Fill(dc, t, *value ? RGB(140, 145, 154) : kControl);
-        const int kx = *value ? t.right - th + 3 : t.left + 3;
-        Fill(dc, RECT{kx, t.top + 3, kx + th - 6, t.bottom - 3}, *value ? RGB(250, 250, 250) : kDim);
-        AddHot(RECT{t.left - 8, t.top - 8, t.right, t.bottom + 8}, key++, [this, value] {
-            *value = !*value;
-            Redraw();
-        }, L"");
+        const float a = Animate(key, value);
+        COLORREF track = Mix(kTrackOff, kPrimary, a);
+        if (hover_ == key) track = Mix(track, value ? kPrimaryHover : kPress, 0.6f);
+        FillRound(dc, t, th / 2, track);
+        FillCircle(dc, t.left + 12.0f + a * (tw - 24), t.top + th / 2.0f, 8.5f, Mix(kKnobOff, kOnPrimary, a));
+        AddHot(RECT{t.left - 10, t.top - 10, t.right + 4, t.bottom + 10}, key++, [this, act] { act(); Redraw(); }, L"");
         end_row(row_h);
     };
     auto info = [&](const std::wstring& name, const std::wstring& text) {
@@ -322,13 +364,14 @@ void ShellUi::DrawSettings(HDC dc, const RECT& area) {
         Text(dc, RECT{rx, y + 32, rx + rw, y + 68}, text, font_small_, kDim, DT_LEFT | DT_WORDBREAK);
         end_row(76);
     };
-    auto button = [&](const std::wstring& name, const std::wstring& caption, UINT cmd) {
-        label(name);
-        const RECT b = {rx + rw - ctl_w, y + (row_h - ctl_h) / 2, rx + rw, y + (row_h - ctl_h) / 2 + ctl_h};
-        Fill(dc, b, StateColor(key, kControl));
+    auto button = [&](const std::wstring& name, const std::wstring& caption, UINT cmd, int h, int w) {
+        label(name, h);
+        const int bh = std::min(ctl_h, h - 10);
+        const RECT b = {rx + rw - w, y + (h - bh) / 2, rx + rw, y + (h - bh) / 2 + bh};
+        FillRound(dc, b, 9, StateColor(key, kControl, kHover, kPress));
         Text(dc, b, caption, font_ui_, kText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         AddHot(b, key++, [this, cmd] { Command(cmd); }, L"");
-        end_row(row_h);
+        end_row(h);
     };
     // Steps through a fixed list of options without wrapping around.
     auto step = [](size_t index, size_t count, int delta) {
@@ -336,6 +379,7 @@ void ShellUi::DrawSettings(HDC dc, const RECT& area) {
         return size_t(n < 0 ? 0 : n >= int64_t(count) ? count - 1 : n);
     };
 
+    bool saved_page = true;  // pages whose values are written by "Save changes"
     switch (page_) {
         case 0: {
             const size_t i = IndexOf(kRamMb, [&](uint64_t v) { return v == edit_.ram_mb; });
@@ -362,41 +406,64 @@ void ShellUi::DrawSettings(HDC dc, const RECT& area) {
             choice(L"Pixel density", std::to_wstring(edit_.dpi) + L" DPI",
                    [this, d, step] { edit_.dpi = kDpis[step(d, std::size(kDpis), -1)]; },
                    [this, d, step] { edit_.dpi = kDpis[step(d, std::size(kDpis), 1)]; });
-            toggle(L"Aetheron boot screen", &edit_.boot_splash);
+            toggle(L"Aetheron boot screen", edit_.boot_splash, [this] { edit_.boot_splash = !edit_.boot_splash; });
             info(L"Tip", L"A lower resolution is faster, because Android draws every pixel on the CPU.");
             break;
         }
-        case 2:
-            toggle(L"Internet access (built-in NAT)", &edit_.network);
+        case kPageControls: {
+            saved_page = false;  // these apply at once
+            toggle(L"Key mapping (keys press spots on the screen)", controls_.enabled, [this] { Command(kUiKmEnable); });
+            toggle(L"Show the keys on the screen", controls_.hints, [this] { Command(kUiKmHints); });
+            toggle(L"W A S D joystick", controls_.dpad, [this] { Command(kUiKmDpad); });
+            button(L"Joystick position", L"Place on screen", kUiKmPlaceDpad, 46, 150);
+            button(L"Map a key to a spot on the screen", L"Add key", kUiKmAdd, 46, 150);
+            const int row = 38;
+            const int fit = std::max(0, (bottom - y) / row);
+            const int shown = std::min<int>(int(controls_.taps.size()), fit);
+            for (int i = 0; i < shown; ++i) {
+                // The last visible row turns into a note when more keys exist than fit.
+                if (i == shown - 1 && shown < int(controls_.taps.size())) {
+                    Text(dc, RECT{rx, y, rx + rw, y + row},
+                         L"+ " + std::to_wstring(controls_.taps.size() - size_t(i)) +
+                             L" more keys - see config\\aetheron_keymap.txt",
+                         font_small_, kDim, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                    break;
+                }
+                button(controls_.taps[size_t(i)], L"Remove", kUiKmRemove + UINT(i), row, 96);
+            }
             break;
+        }
         case 3:
-            toggle(L"Run the clean-up script after boot", &edit_.first_boot_setup);
-            info(L"Clean-up script", L"config\\aetheron_setup.sh hides unwanted apps and applies the dark theme. "
-                                     L"It runs once, and again whenever the file changes.");
-            button(L"Erase all Android data", L"Factory reset...", kUiWipe);
+            toggle(L"Internet access (built-in NAT)", edit_.network, [this] { edit_.network = !edit_.network; });
             break;
         case 4:
-            button(L"Android console (serial)", L"Open", kUiShowConsole);
-            button(L"Collect logs into a zip", L"Collect", kUiCollectLogs);
-            button(L"Aetheron folder", L"Open", kUiOpenFolder);
-            button(L"Install an app (.apk) / copy a file", L"Choose file...", kUiInstallApk);
-            info(L"adb", L"Android is reachable from Windows with: adb connect 127.0.0.1:6520. Installing apps "
-                         L"needs adb.exe (Android platform-tools) in the tools folder next to Aetheron.exe.");
+            toggle(L"Run the clean-up script after boot", edit_.first_boot_setup,
+                   [this] { edit_.first_boot_setup = !edit_.first_boot_setup; });
+            info(L"Clean-up script", L"config\\aetheron_setup.sh hides unwanted apps and applies the dark theme. "
+                                     L"It runs once, and again whenever the file changes.");
+            button(L"Erase all Android data", L"Factory reset...", kUiWipe, row_h, ctl_w);
+            break;
+        case 5:
+            saved_page = false;
+            button(L"Android console (serial)", L"Open", kUiShowConsole, row_h, ctl_w);
+            button(L"Collect logs into a zip", L"Collect", kUiCollectLogs, row_h, ctl_w);
+            button(L"Aetheron folder", L"Open", kUiOpenFolder, row_h, ctl_w);
             break;
         default:
+            saved_page = false;
             info(L"Aetheron", L"Runs real Android in a virtual machine on the Windows Hypervisor Platform.");
             break;
     }
 
     // Footer: these settings are read at start-up, so say so next to the save button.
-    if (page_ <= 3) {
+    if (saved_page) {
         y += 18;
         const bool dirty = !(edit_ == saved_);
-        Text(dc, RECT{rx, y, rx + rw - 170, y + 36}, L"Changes apply the next time Aetheron starts.", font_small_, kDim,
+        Text(dc, RECT{rx, y, rx + rw - 170, y + 38}, L"Changes apply the next time Aetheron starts.", font_small_, kDim,
              DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        const RECT b = {rx + rw - 150, y, rx + rw, y + 36};
-        Fill(dc, b, dirty ? StateColor(190, RGB(86, 90, 98)) : kControl);
-        Text(dc, b, L"Save changes", font_bold_, dirty ? kText : kDim, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        const RECT b = {rx + rw - 150, y, rx + rw, y + 38};
+        FillRound(dc, b, 10, dirty ? StateColor(190, kPrimary, kPrimaryHover, kDim) : kControl);
+        Text(dc, b, L"Save changes", font_bold_, dirty ? kOnPrimary : kDim, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         if (dirty) AddHot(b, 190, [this] { Command(kUiSaveSettings); }, L"");
     }
 }
@@ -412,6 +479,7 @@ void ShellUi::Paint(HDC window_dc) {
     HGDIOBJ old = SelectObject(dc, bmp);
     SetBkMode(dc, TRANSPARENT);
     hots_.clear();
+    animating_ = false;
     Fill(dc, rc, kContent);
     if (settings_open_) DrawSettings(dc, ContentRect());
     if (bars_) DrawBars(dc, rc);
@@ -419,6 +487,14 @@ void ShellUi::Paint(HDC window_dc) {
     SelectObject(dc, old);
     DeleteObject(bmp);
     DeleteDC(dc);
+    // Repaint at ~60 Hz only while a toggle is still sliding.
+    if (animating_ && !timer_on_) {
+        SetTimer(hwnd_, kAnimTimer, 15, nullptr);
+        timer_on_ = true;
+    } else if (!animating_ && timer_on_) {
+        KillTimer(hwnd_, kAnimTimer);
+        timer_on_ = false;
+    }
 }
 
 }  // namespace Aetheron

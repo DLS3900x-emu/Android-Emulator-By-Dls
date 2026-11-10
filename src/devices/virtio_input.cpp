@@ -10,6 +10,8 @@ constexpr uint8_t kCfgIdName = 0x01, kCfgIdSerial = 0x02, kCfgIdDevids = 0x03, k
 constexpr uint16_t kEvKey = 0x01, kEvAbs = 0x03;
 constexpr uint16_t kBtnTouch = 0x14A;
 constexpr uint8_t kPropDirect = 0x01;
+constexpr uint8_t kAbsMtSlot = 0x2F, kAbsMtX = 0x35, kAbsMtY = 0x36, kAbsMtTrackingId = 0x39;
+constexpr uint32_t kTouchSlots = 10;
 }  // namespace
 
 VirtioInput::VirtioInput(GuestMemory* mem, Kind kind, uint32_t abs_w, uint32_t abs_h)
@@ -74,6 +76,11 @@ void VirtioInput::Refresh() {
                 if (subsel_ == kEvAbs) {
                     set_bit(0x00);  // ABS_X
                     set_bit(0x01);  // ABS_Y
+                    // Multi-touch protocol B: one slot per finger.
+                    set_bit(kAbsMtSlot);
+                    set_bit(kAbsMtX);
+                    set_bit(kAbsMtY);
+                    set_bit(kAbsMtTrackingId);
                 }
             } else if (subsel_ == kEvKey) {
                 for (int k = 1; k <= 248; ++k) set_bit(k);
@@ -81,8 +88,13 @@ void VirtioInput::Refresh() {
             }
             break;
         case kCfgAbsInfo:
-            if (kind_ == Kind::Touchscreen && (subsel_ == 0 || subsel_ == 1)) {
-                uint32_t info[5] = {0, (subsel_ == 0 ? abs_w_ : abs_h_) - 1, 0, 0, 0};
+            if (kind_ == Kind::Touchscreen && (subsel_ == 0 || subsel_ == 1 || subsel_ == kAbsMtSlot ||
+                                               subsel_ == kAbsMtX || subsel_ == kAbsMtY || subsel_ == kAbsMtTrackingId)) {
+                const uint32_t max = subsel_ == 0 || subsel_ == kAbsMtX   ? abs_w_ - 1
+                                     : subsel_ == 1 || subsel_ == kAbsMtY ? abs_h_ - 1
+                                     : subsel_ == kAbsMtSlot              ? kTouchSlots - 1
+                                                                          : 65535;
+                uint32_t info[5] = {0, max, 0, 0, 0};
                 std::memcpy(u, info, sizeof(info));
                 size = sizeof(info);
             }

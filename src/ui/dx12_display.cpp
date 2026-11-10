@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "../common/log.h"
+#include "gdiplus_util.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -113,6 +114,97 @@ void Dx12Display::SetSplash(bool show, int percent, const std::wstring& text) {
     ++splash_version_;
 }
 
+void Dx12Display::SetOverlay(std::vector<OverlayMarker> markers) {
+    std::lock_guard<std::mutex> lock(splash_mutex_);
+    overlay_ = std::move(markers);
+    ++overlay_version_;
+}
+
+// Renders the markers once into two coverage masks (discs and labels), so
+// that drawing them on each frame is only a blend inside small rectangles.
+void Dx12Display::BuildOverlay() {
+    std::vector<OverlayMarker> markers;
+    {
+        std::lock_guard<std::mutex> lock(splash_mutex_);
+        markers = overlay_;
+        overlay_built_ = overlay_version_;
+    }
+    overlay_w_ = width_;
+    overlay_h_ = height_;
+    overlay_rects_.clear();
+    if (markers.empty()) return;
+    const int w = int(width_), h = int(height_);
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bmp = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+    if (!bmp) {
+        if (dc) DeleteDC(dc);
+        return;
+    }
+    HGDIOBJ old_bmp = SelectObject(dc, bmp);
+    const size_t n = size_t(w) * h;
+    auto grab = [&](std::vector<uint8_t>* mask) {
+        GdiFlush();
+        mask->resize(n);
+        const uint8_t* p = static_cast<const uint8_t*>(bits);
+        for (size_t i = 0; i < n; ++i) (*mask)[i] = p[i * 4 + 1];  // green channel of white-on-black
+    };
+    std::memset(bits, 0, n * 4);
+    for (const OverlayMarker& m : markers) FillCircle(dc, m.x * w, m.y * h, m.radius * h, RGB(255, 255, 255));
+    grab(&overlay_disc_);
+
+    std::memset(bits, 0, n * 4);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    HFONT font = CreateFontW(-(h / 30 > 12 ? h / 30 : 12), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    HGDIOBJ old_font = SelectObject(dc, font);
+    for (const OverlayMarker& m : markers) {
+        const int cx = int(m.x * w), cy = int(m.y * h), r = int(m.radius * h) + 2;
+        RECT box = {cx - r, cy - r, cx + r, cy + r};
+        DrawTextW(dc, m.label.c_str(), -1, &box, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
+        // The label may be wider than its disc; blend a generous box around it.
+        RECT area = {cx - r - w / 16, cy - r, cx + r + w / 16, cy + r};
+        area.left = area.left < 0 ? 0 : area.left;
+        area.top = area.top < 0 ? 0 : area.top;
+        area.right = area.right > w ? w : area.right;
+        area.bottom = area.bottom > h ? h : area.bottom;
+        if (area.right > area.left && area.bottom > area.top) overlay_rects_.push_back(area);
+    }
+    grab(&overlay_text_);
+    SelectObject(dc, old_font);
+    SelectObject(dc, old_bmp);
+    DeleteObject(font);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+}
+
+void Dx12Display::BlendOverlay(uint8_t* dst) {
+    for (const RECT& r : overlay_rects_) {
+        for (int y = r.top; y < r.bottom; ++y) {
+            uint8_t* row = dst + size_t(y) * pitch_;
+            const size_t base = size_t(y) * overlay_w_;
+            for (int x = r.left; x < r.right; ++x) {
+                const uint32_t disc = overlay_disc_[base + x] * 150u / 255u, text = overlay_text_[base + x];
+                if (!disc && !text) continue;
+                uint8_t* p = row + size_t(x) * 4;
+                for (int c = 0; c < 3; ++c) {
+                    uint32_t v = (p[c] * (255u - disc) + 22u * disc) / 255u;  // darken under the disc
+                    v = (v * (255u - text) + 255u * text) / 255u;             // white label
+                    p[c] = uint8_t(v);
+                }
+            }
+        }
+    }
+}
+
 // Renders the boot screen with GDI into the upload buffer (BGRA rows).
 void Dx12Display::DrawSplash(uint8_t* dst) {
     std::wstring text;
@@ -207,7 +299,9 @@ bool Dx12Display::PresentFrame() {
         }
         const bool splash = splash_on_;
         // The top bit keeps boot-screen versions distinct from guest frame numbers.
-        const uint64_t frame = splash ? (0x8000000000000000ULL | splash_version_.load()) : scanout_->frame.load();
+        // The overlay version is part of the number so that a changed overlay redraws a still picture.
+        const uint64_t frame = splash ? (0x8000000000000000ULL | splash_version_.load())
+                                      : scanout_->frame.load() + (overlay_version_.load() << 40);
         // Nothing new to show: skip the copy and the present (re-present now
         // and then so a resized window never keeps a stale picture for long).
         idle = frame == last_frame_ && ++idle_frames_ < 120;
@@ -222,6 +316,8 @@ bool Dx12Display::PresentFrame() {
             } else if (scanout_->enabled && scanout_->width == width_ && scanout_->height == height_) {
                 for (uint32_t y = 0; y < height_; ++y)
                     std::memcpy(dst + size_t(y) * pitch_, scanout_->bgra.data() + size_t(y) * width_, width_ * 4);
+                if (overlay_built_ != overlay_version_ || overlay_w_ != width_ || overlay_h_ != height_) BuildOverlay();
+                if (!overlay_rects_.empty()) BlendOverlay(dst);
             } else {
                 std::memset(dst, 0, size_t(pitch_) * height_);
             }

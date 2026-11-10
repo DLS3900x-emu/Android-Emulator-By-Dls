@@ -14,6 +14,7 @@
 #include "devices/virtio_net.h"
 #include "devices/virtio_vsock.h"
 #include "host/oemlock.h"
+#include "ui/keymapper.h"
 #include "boot/ramdisk_inspect.h"
 #include <memory>
 #include <string>
@@ -221,6 +222,25 @@ int main(){
     send(4,nullptr,30,45); CHECK(connected==0); CHECK(used()==7); CHECK((rx32(6,28)>>16)==3);    // SHUTDOWN -> RST, closed
     CHECK(!vs.HostSend(h,(const uint8_t*)"x",1));
     printf("virtio-vsock host stream OK\n"); }
+  // ---- key mapping: keys become fingers ----
+  { KeyMapper km; km.aspect = 2.0f;
+    km.Parse("# c\nenabled on\nhints off\ndpad on W A S D 0.200 0.700 0.100\ntap F 0.850 0.600\ntap space 0.9 0.9\ntap bogus 1 1\n");
+    CHECK(km.taps.size()==2 && km.taps[1].vk==0x20 && !km.hints && km.dpad.enabled);
+    KeyMapper again; again.Parse(km.Serialize()); CHECK(again.Serialize()==km.Serialize()); CHECK(again.taps.size()==2);
+    std::vector<std::string> ev; char b[80];
+    KeyMapper::TouchFn t=[&](int s,bool d,float x,float y){ snprintf(b,sizeof(b),"%d %d %.2f %.2f",s,int(d),x,y); ev.push_back(b); };
+    CHECK(!km.OnKey('Q',true,t)); CHECK(ev.empty());                                   // unmapped keys pass through
+    CHECK(km.OnKey('F',true,t)); CHECK(km.OnKey('F',true,t)); CHECK(ev.size()==1 && ev[0]=="2 1 0.85 0.60");   // repeat ignored
+    CHECK(km.OnKey(0x20,true,t)); CHECK(ev.back()=="3 1 0.90 0.90");                    // second finger, own slot
+    CHECK(km.OnKey('W',true,t)); CHECK(ev.size()==4 && ev[2]=="1 1 0.20 0.70" && ev[3]=="1 1 0.20 0.60");      // lands on centre, slides up
+    CHECK(km.OnKey('D',true,t)); CHECK(ev.back()=="1 1 0.24 0.63");                     // diagonal, x scaled by aspect
+    CHECK(km.OnKey('W',false,t)); CHECK(ev.back()=="1 1 0.25 0.70");
+    CHECK(km.OnKey('D',false,t)); CHECK(ev.back()=="1 0 0.20 0.70");                    // all released: finger up
+    CHECK(km.OnKey('F',false,t)); CHECK(ev.back()=="2 0 0.85 0.60");
+    size_t n=ev.size(); km.ReleaseAll(t); CHECK(ev.size()==n+1 && ev.back().substr(0,3)=="3 0");
+    km.enabled=false; CHECK(!km.OnKey('F',true,t));
+    CHECK(KeyMapper::KeyName(0x70)=="F1" && KeyMapper::KeyFromName("f12")==0x7B && KeyMapper::KeyFromName(KeyMapper::KeyName(191))==191);
+    printf("key mapping OK\n"); }
   // ---- all 30 PCI slots used by the emulator fit on the bus ----
   { Irq irq; PciBus bus(&irq); GuestMemory mem; CHECK(mem.Allocate(1<<20)); std::vector<std::unique_ptr<VirtioConsole>> cs;
     for (uint8_t s=1;s<=26;++s){ cs.emplace_back(new VirtioConsole(&mem, "")); bus.AddDevice(s, cs.back().get(), 16+(s%8)); }

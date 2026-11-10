@@ -93,19 +93,3 @@ open source and Aetheron does not include them.
   then treats the device as uncertified and Play may refuse to sign in until
   the device is registered. That is between you and Google's terms.
 
-## How Aetheron talks to Android
-
-While Android runs, Aetheron listens on `127.0.0.1:6520` and carries the
-connection to `adbd` inside Android (virtio-vsock port 5555), the same way
-Cuttlefish does. Any adb command works:
-
-```
-adb connect 127.0.0.1:6520
-adb -s 127.0.0.1:6520 install app.apk
-adb -s 127.0.0.1:6520 shell
-```
-
-The *Install an app* sidebar button and dropping files on the window use
-exactly this. They need `adb.exe` from Google's "SDK Platform-Tools"
-(<https://developer.android.com/tools/releases/platform-tools>) in a `tools`
-folder next to `Aetheron.exe`.

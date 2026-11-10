@@ -1,3 +1,23 @@
+# v9
+
+- **Key mapping** (keyboard icon in the sidebar, or Settings -> Controls):
+  - *Add key*: click a spot on the Android screen, then press a key. Holding
+    that key holds a finger on that spot.
+  - *W A S D joystick*: place it on the game's on-screen stick; the four keys
+    drag a finger around it (diagonals work).
+  - Each held key is its own finger, so moving and pressing buttons work at
+    the same time. The virtual touch screen is now multi-touch (10 fingers).
+  - Optional hints show the keys on the Android screen. Mappings are kept in
+    `config\aetheron_keymap.txt`.
+- **Modern look**: rounded hover states, rounded controls on a settings card,
+  pill toggles that slide.
+- **Removed for now**: the install-app button, drag and drop, and the adb
+  listener (it can be switched on with `adb_bridge = on` in `aetheron.ini`).
+
+Tested here: key-mapping logic (new harness test), the chrome rendered under
+Wine (`tests/ui_preview`), clean Windows cross-build. Not tested: key mapping
+inside a real game on Windows.
+
 # v8
 
 - **Multi-core (experimental)**: Android can now get up to 8 CPU cores
