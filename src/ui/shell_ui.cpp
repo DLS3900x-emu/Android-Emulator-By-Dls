@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <iterator>
 
 #include "gdiplus_util.h"
@@ -18,12 +19,13 @@ constexpr COLORREF kIcon = RGB(196, 199, 205), kCloseHover = RGB(196, 43, 28);
 constexpr COLORREF kPrimary = RGB(226, 228, 233), kPrimaryHover = RGB(205, 208, 214), kOnPrimary = RGB(24, 25, 28);
 constexpr COLORREF kTrackOff = RGB(58, 60, 66), kKnobOff = RGB(170, 174, 182);
 
-// Glyphs of the Windows icon font "Segoe MDL2 Assets".
-constexpr wchar_t kGlyphMenu = 0xE700, kGlyphSettings = 0xE713, kGlyphBack = 0xE72B, kGlyphHome = 0xE80F,
-                  kGlyphRecents = 0xE7C4, kGlyphFullscreen = 0xE740, kGlyphCamera = 0xE722, kGlyphConsole = 0xE756,
-                  kGlyphFolder = 0xE8B7, kGlyphLogs = 0xE8A5, kGlyphKeyboard = 0xE765, kGlyphMinimize = 0xE921,
-                  kGlyphMaximize = 0xE922, kGlyphRestore = 0xE923, kGlyphClose = 0xE8BB, kGlyphPrev = 0xE76B,
-                  kGlyphNext = 0xE76C;
+// Icons are drawn as vector strokes (see DrawIcon), so they do not depend on
+// any icon font being installed.
+enum Icon {
+    kGlyphMenu, kGlyphSettings, kGlyphBack, kGlyphHome, kGlyphRecents, kGlyphFullscreen, kGlyphCamera,
+    kGlyphConsole, kGlyphFolder, kGlyphLogs, kGlyphKeyboard, kGlyphMinimize, kGlyphMaximize, kGlyphRestore,
+    kGlyphClose, kGlyphPrev, kGlyphNext
+};
 
 const wchar_t* const kPages[] = {L"Performance", L"Display", L"Controls", L"Network", L"Android", L"Tools", L"About"};
 
@@ -50,6 +52,120 @@ COLORREF Mix(COLORREF a, COLORREF b, float t) {
 }
 
 RECT Inset(const RECT& r, int dx, int dy) { return RECT{r.left + dx, r.top + dy, r.right - dx, r.bottom - dy}; }
+
+// Draws `icon` centred in `r` on a 16-unit grid.
+void DrawIcon(HDC dc, const RECT& r, int icon, COLORREF color) {
+    using namespace Gdiplus;
+    Graphics g(dc);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(PixelOffsetModeHalf);
+    const float size = 17.0f, u = size / 16.0f;
+    const float ox = (r.left + r.right) / 2.0f - size / 2, oy = (r.top + r.bottom) / 2.0f - size / 2;
+    Pen pen(GdipColor(color), 1.5f);
+    pen.SetStartCap(LineCapRound);
+    pen.SetEndCap(LineCapRound);
+    pen.SetLineJoin(LineJoinRound);
+    SolidBrush brush(GdipColor(color));
+    auto X = [&](float v) { return ox + v * u; };
+    auto Y = [&](float v) { return oy + v * u; };
+    auto line = [&](float x1, float y1, float x2, float y2) { g.DrawLine(&pen, X(x1), Y(y1), X(x2), Y(y2)); };
+    auto poly = [&](std::initializer_list<float> pts, bool closed) {
+        std::vector<PointF> v;
+        for (auto it = pts.begin(); it != pts.end(); it += 2) v.emplace_back(X(*it), Y(*(it + 1)));
+        if (closed) g.DrawPolygon(&pen, v.data(), int(v.size()));
+        else g.DrawLines(&pen, v.data(), int(v.size()));
+    };
+    auto box = [&](float x, float y, float w, float h, float rad) {
+        const float d = rad * 2 * u;
+        GraphicsPath path;
+        path.AddArc(X(x), Y(y), d, d, 180, 90);
+        path.AddArc(X(x + w) - d, Y(y), d, d, 270, 90);
+        path.AddArc(X(x + w) - d, Y(y + h) - d, d, d, 0, 90);
+        path.AddArc(X(x), Y(y + h) - d, d, d, 90, 90);
+        path.CloseFigure();
+        g.DrawPath(&pen, &path);
+    };
+    auto dot = [&](float x, float y, float rad) { g.FillEllipse(&brush, X(x - rad), Y(y - rad), rad * 2 * u, rad * 2 * u); };
+    auto ring = [&](float x, float y, float rad) { g.DrawEllipse(&pen, X(x - rad), Y(y - rad), rad * 2 * u, rad * 2 * u); };
+    switch (icon) {
+        case kGlyphMenu:
+            line(2.5f, 4, 13.5f, 4);
+            line(2.5f, 8, 13.5f, 8);
+            line(2.5f, 12, 13.5f, 12);
+            break;
+        case kGlyphSettings:  // three sliders
+            line(2, 4, 14, 4);
+            line(2, 8, 14, 8);
+            line(2, 12, 14, 12);
+            dot(10.5f, 4, 2);
+            dot(5.5f, 8, 2);
+            dot(11, 12, 2);
+            break;
+        case kGlyphBack:
+            line(13, 8, 3, 8);
+            poly({7.5f, 3.5f, 3, 8, 7.5f, 12.5f}, false);
+            break;
+        case kGlyphHome:
+            poly({1.5f, 8, 8, 2, 14.5f, 8}, false);
+            poly({3.5f, 7, 3.5f, 13.5f, 12.5f, 13.5f, 12.5f, 7}, false);
+            break;
+        case kGlyphRecents:
+            box(2, 5, 9, 9, 1.5f);
+            poly({5.5f, 2.5f, 14, 2.5f, 14, 11}, false);
+            break;
+        case kGlyphFullscreen:
+            poly({2, 6, 2, 2, 6, 2}, false);
+            poly({10, 2, 14, 2, 14, 6}, false);
+            poly({14, 10, 14, 14, 10, 14}, false);
+            poly({6, 14, 2, 14, 2, 10}, false);
+            break;
+        case kGlyphCamera:
+            box(1.5f, 4.5f, 13, 9.5f, 2);
+            poly({5.5f, 4.5f, 6.5f, 2.5f, 9.5f, 2.5f, 10.5f, 4.5f}, false);
+            ring(8, 9.2f, 2.6f);
+            break;
+        case kGlyphConsole:
+            box(1.5f, 2.5f, 13, 11, 2);
+            poly({4.5f, 6, 7, 8, 4.5f, 10}, false);
+            line(8.5f, 10.5f, 11.5f, 10.5f);
+            break;
+        case kGlyphFolder:
+            poly({1.5f, 13, 1.5f, 3.5f, 6, 3.5f, 7.5f, 5.5f, 14.5f, 5.5f, 14.5f, 13}, true);
+            break;
+        case kGlyphLogs:  // a document
+            poly({3.5f, 1.5f, 9.5f, 1.5f, 12.5f, 4.5f, 12.5f, 14.5f, 3.5f, 14.5f}, true);
+            line(5.5f, 8, 10.5f, 8);
+            line(5.5f, 11, 10.5f, 11);
+            break;
+        case kGlyphKeyboard:
+            box(1, 3.5f, 14, 9, 2);
+            dot(4.5f, 6.7f, 0.8f);
+            dot(8, 6.7f, 0.8f);
+            dot(11.5f, 6.7f, 0.8f);
+            line(5, 10, 11, 10);
+            break;
+        case kGlyphMinimize:
+            line(3.5f, 8, 12.5f, 8);
+            break;
+        case kGlyphMaximize:
+            box(3.5f, 3.5f, 9, 9, 1);
+            break;
+        case kGlyphRestore:
+            box(3, 5.5f, 7.5f, 7.5f, 1);
+            poly({5.5f, 3, 13, 3, 13, 10.5f}, false);
+            break;
+        case kGlyphClose:
+            line(4, 4, 12, 12);
+            line(12, 4, 4, 12);
+            break;
+        case kGlyphPrev:
+            poly({9.5f, 4, 5.5f, 8, 9.5f, 12}, false);
+            break;
+        case kGlyphNext:
+            poly({6.5f, 4, 10.5f, 8, 6.5f, 12}, false);
+            break;
+    }
+}
 
 }  // namespace
 
@@ -170,7 +286,6 @@ void ShellUi::EnsureFonts() {
     font_small_ = make(12, FW_NORMAL, L"Segoe UI");
     font_bold_ = make(14, FW_SEMIBOLD, L"Segoe UI");
     font_big_ = make(22, FW_SEMIBOLD, L"Segoe UI");
-    font_icon_ = make(15, FW_NORMAL, L"Segoe MDL2 Assets");
 }
 
 void ShellUi::Fill(HDC dc, const RECT& r, COLORREF c) {
@@ -214,12 +329,12 @@ float ShellUi::Animate(int key, bool on) {
     return it->second;
 }
 
-void ShellUi::IconButton(HDC dc, const RECT& r, int key, wchar_t glyph, const std::wstring& hint, UINT cmd,
+void ShellUi::IconButton(HDC dc, const RECT& r, int key, int glyph, const std::wstring& hint, UINT cmd,
                          bool danger) {
     const bool hot = key == hover_;
     if (hot || key == pressed_)
         FillRound(dc, Inset(r, 5, 4), 8, danger ? kCloseHover : StateColor(key, kBar, kHover, kPress));
-    Text(dc, r, std::wstring(1, glyph), font_icon_, hot ? kText : kIcon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawIcon(dc, r, glyph, hot ? kText : kIcon);
     AddHot(r, key, [this, cmd] { Command(cmd); }, hint);
 }
 
@@ -257,7 +372,7 @@ void ShellUi::DrawBars(HDC dc, const RECT& client) {
     Fill(dc, RECT{cw - kSideW, kTopH, cw, ch}, kBar);
     const int bh = 42;
     int y = kTopH + 4;
-    auto side_btn = [&](int key, wchar_t glyph, const wchar_t* hint, UINT cmd) {
+    auto side_btn = [&](int key, int glyph, const wchar_t* hint, UINT cmd) {
         IconButton(dc, RECT{cw - kSideW, y, cw, y + bh}, key, glyph, hint, cmd);
         y += bh;
     };
@@ -298,8 +413,7 @@ void ShellUi::DrawSettings(HDC dc, const RECT& area) {
     {
         const RECT r = {card.right - 54, card.top + 18, card.right - 18, card.top + 54};
         if (hover_ == 100) FillRound(dc, r, 10, StateColor(100, kPanel, kHover, kPress));
-        Text(dc, r, std::wstring(1, kGlyphClose), font_icon_, hover_ == 100 ? kText : kIcon,
-             DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawIcon(dc, r, kGlyphClose, hover_ == 100 ? kText : kIcon);
         AddHot(r, 100, [this] { Command(kUiSettings); }, L"Close settings");
     }
 
@@ -331,9 +445,9 @@ void ShellUi::DrawSettings(HDC dc, const RECT& area) {
         y += h;
         Fill(dc, RECT{rx, y - 1, rx + rw, y}, kLine);
     };
-    auto chevron = [&](const RECT& r, wchar_t glyph, std::function<void()> act) {
+    auto chevron = [&](const RECT& r, int glyph, std::function<void()> act) {
         if (hover_ == key) FillCircle(dc, (r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f, 13, StateColor(key, kControl, kHover, kPress));
-        Text(dc, r, std::wstring(1, glyph), font_icon_, hover_ == key ? kText : kIcon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawIcon(dc, r, glyph, hover_ == key ? kText : kIcon);
         AddHot(r, key++, [this, act] { act(); Redraw(); }, L"");
     };
     auto choice = [&](const std::wstring& name, const std::wstring& value, std::function<void()> prev,

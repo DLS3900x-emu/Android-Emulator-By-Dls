@@ -1,3 +1,8 @@
+# v10
+
+- **Icons are drawn by Aetheron itself** (vector shapes) instead of coming
+  from a Windows icon font, which showed as empty boxes on some PCs.
+
 # v9
 
 - **Key mapping** (keyboard icon in the sidebar, or Settings -> Controls):

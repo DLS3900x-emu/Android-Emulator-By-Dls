@@ -99,7 +99,7 @@ private:
     void Text(HDC dc, const RECT& r, const std::wstring& s, HFONT f, COLORREF c, UINT flags);
     void AddHot(const RECT& r, int key, std::function<void()> act, const std::wstring& hint);
     COLORREF StateColor(int key, COLORREF normal, COLORREF hover, COLORREF press) const;
-    void IconButton(HDC dc, const RECT& r, int key, wchar_t glyph, const std::wstring& hint, UINT cmd,
+    void IconButton(HDC dc, const RECT& r, int key, int glyph, const std::wstring& hint, UINT cmd,
                     bool danger = false);
     void DrawBars(HDC dc, const RECT& client);
     void DrawSettings(HDC dc, const RECT& area);
@@ -110,7 +110,7 @@ private:
     std::vector<Hot> hots_;
     int hover_ = -1, pressed_ = -1;
     std::wstring status_;
-    HFONT font_ui_ = nullptr, font_bold_ = nullptr, font_big_ = nullptr, font_icon_ = nullptr, font_small_ = nullptr;
+    HFONT font_ui_ = nullptr, font_bold_ = nullptr, font_big_ = nullptr, font_small_ = nullptr;
 
     bool settings_open_ = false;
     int page_ = 0;
