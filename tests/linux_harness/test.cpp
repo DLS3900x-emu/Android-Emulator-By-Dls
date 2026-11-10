@@ -16,6 +16,7 @@
 #include "host/oemlock.h"
 #include "boot/ramdisk_inspect.h"
 #include <memory>
+#include <string>
 #include <cstring>
 using namespace Aetheron;
 #define CHECK(c) do{ if(!(c)){ printf("FAIL %s:%d %s\n",__FILE__,__LINE__,#c); return 1;} }while(0)
@@ -188,6 +189,38 @@ int main(){
     send(4,0,2); CHECK(used()==3); CHECK((rx(2,28)>>16)==3);   // shutdown -> RST
     send(1,0,7); CHECK(used()==4); CHECK((rx(3,28)>>16)==3);   // unknown CID -> RST
     printf("virtio-vsock OK\n"); }
+  // ---- virtio-vsock: host-initiated stream (the adb bridge path) ----
+  { GuestMemory mem; CHECK(mem.Allocate(16<<20)); Irq irq; VirtioVsock vs(&mem); vs.SetIrq(&irq, 17); vs.ConfigWrite(4,2,0x6);
+    auto W=[&](uint64_t o,uint8_t s,uint64_t v){vs.BarWrite(o,s,v);};
+    W(0x14,1,1); W(0x14,1,3); W(0x08,4,0); W(0x0C,4,0); W(0x08,4,1); W(0x0C,4,1); W(0x14,1,0xB);
+    auto setq=[&](int q,uint64_t base){ W(0x16,2,q); W(0x18,2,8); W(0x20,4,base); W(0x24,4,0); W(0x28,4,base+0x1000); W(0x2C,4,0); W(0x30,4,base+0x2000); W(0x34,4,0); W(0x1C,2,1); };
+    setq(0,0x10000); setq(1,0x20000); setq(2,0x50000); W(0x14,1,0xF);
+    auto D=[&](uint64_t desc,int i,uint64_t a,uint32_t l,uint16_t f){ uint8_t b[16]={}; memcpy(b,&a,8);memcpy(b+8,&l,4);memcpy(b+12,&f,2); mem.Write(desc+16*i,b,16);};
+    auto avail=[&](uint64_t base,uint16_t idx,uint16_t head){ mem.Write(base+0x1000+4+2*(idx%8),&head,2); uint16_t n=idx+1; mem.Write(base+0x1000+2,&n,2);};
+    for(int i=0;i<8;++i){ D(0x10000,i,0x30000+0x100*i,64,2); avail(0x10000,i,i); } W(0x3000,2,0);   // 64-byte rx buffers: 20 payload bytes each
+    std::string got; int connected=-1;
+    uint32_t h=vs.HostConnect(5555,[&](const uint8_t* d,size_t n){ got.append((const char*)d,n); },[&](bool c){ connected=c; });
+    auto rx32=[&](int i,size_t off){ uint32_t v; mem.Read(0x30000+0x100*i+off,&v,4); return v; };
+    auto used=[&]{ uint16_t u; mem.Read(0x10000+0x2000+2,&u,2); return u; };
+    CHECK(used()==1); CHECK((rx32(0,28)>>16)==1 && rx32(0,16)==h && rx32(0,20)==5555);          // REQUEST to guest port 5555
+    CHECK(vs.HostSend(h,(const uint8_t*)"early",5)); CHECK(used()==1);                           // not sent before the guest accepts
+    uint16_t txn=0;
+    auto send=[&](uint16_t op,const char* payload,uint32_t buf_alloc,uint32_t fwd){ uint8_t p[128]={}; uint64_t s=3,dc=2; uint32_t sp=5555,len=payload?uint32_t(strlen(payload)):0; uint16_t ty=1;
+      memcpy(p,&s,8); memcpy(p+8,&dc,8); memcpy(p+16,&sp,4); memcpy(p+20,&h,4); memcpy(p+24,&len,4); memcpy(p+28,&ty,2); memcpy(p+30,&op,2); memcpy(p+36,&buf_alloc,4); memcpy(p+40,&fwd,4);
+      if(len) memcpy(p+44,payload,len);
+      mem.Write(0x40000,p,44+len); D(0x20000,0,0x40000,44+len,0); avail(0x20000,txn++,0); W(0x3004,2,1); };
+    send(2,nullptr,30,0);                                                                        // RESPONSE, guest window 30 bytes
+    CHECK(connected==1); CHECK(used()==2); CHECK((rx32(1,28)>>16)==5 && rx32(1,24)==5);
+    char buf[32]={}; mem.Read(0x30000+0x100*1+44,buf,5); CHECK(std::string(buf)=="early");
+    std::string big(40,'x'); CHECK(vs.HostSend(h,(const uint8_t*)big.data(),big.size()));
+    // window 30, 5 used: 20 bytes (buffer size), then 5 bytes, then a credit request because the window is full
+    CHECK(used()==5); CHECK(rx32(2,24)==20 && rx32(3,24)==5); CHECK((rx32(4,28)>>16)==7);
+    send(6,nullptr,30,30);                                                                       // CREDIT_UPDATE: guest read everything
+    CHECK(used()==6); CHECK(rx32(5,24)==15);
+    send(5,"abc",30,45); CHECK(got=="abc");                                                      // guest -> host data
+    send(4,nullptr,30,45); CHECK(connected==0); CHECK(used()==7); CHECK((rx32(6,28)>>16)==3);    // SHUTDOWN -> RST, closed
+    CHECK(!vs.HostSend(h,(const uint8_t*)"x",1));
+    printf("virtio-vsock host stream OK\n"); }
   // ---- all 30 PCI slots used by the emulator fit on the bus ----
   { Irq irq; PciBus bus(&irq); GuestMemory mem; CHECK(mem.Allocate(1<<20)); std::vector<std::unique_ptr<VirtioConsole>> cs;
     for (uint8_t s=1;s<=26;++s){ cs.emplace_back(new VirtioConsole(&mem, "")); bus.AddDevice(s, cs.back().get(), 16+(s%8)); }

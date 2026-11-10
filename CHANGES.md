@@ -1,3 +1,26 @@
+# v8
+
+- **Multi-core (experimental)**: Android can now get up to 8 CPU cores
+  (`cpus` in `aetheron.ini`, or Settings -> Performance; default 4). The
+  extra cores are started the way a PC does it (INIT / start-up IPI). If
+  Android no longer boots, or hangs, set it back to 1.
+- **Windows <-> Android channel (adb)**: Aetheron listens on
+  `127.0.0.1:6520` and carries connections over virtio-vsock to adbd inside
+  Android, like Cuttlefish does. `adb connect 127.0.0.1:6520` works with any
+  adb.
+- **Install apps / copy files**: new sidebar button, or drop files on the
+  window. `.apk` files are installed, anything else is copied to Android's
+  Download folder. Needs `adb.exe` in the `tools` folder (see
+  `tools\README.txt`).
+- `docs/custom-android-image.md`: how to build your own Android image
+  (launcher, wallpaper, boot animation, app set) and what applies to Google
+  Play.
+
+Tested here: the vsock stream logic (new harness test) and a clean Windows
+cross-build. Not tested: multi-core and adb on a real Windows PC.
+
+Still not done: GPU acceleration (Android still draws in software), audio.
+
 # v7
 
 - **Own window chrome in a gray theme** (no Windows title bar or menu bar):

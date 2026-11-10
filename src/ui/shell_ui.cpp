@@ -16,7 +16,7 @@ constexpr COLORREF kIcon = RGB(198, 201, 206), kCloseHover = RGB(196, 43, 28);
 // Glyphs of the Windows icon font "Segoe MDL2 Assets".
 constexpr wchar_t kGlyphMenu = 0xE700, kGlyphSettings = 0xE713, kGlyphBack = 0xE72B, kGlyphHome = 0xE80F,
                   kGlyphRecents = 0xE7C4, kGlyphFullscreen = 0xE740, kGlyphCamera = 0xE722, kGlyphConsole = 0xE756,
-                  kGlyphFolder = 0xE8B7, kGlyphLogs = 0xE896, kGlyphMinimize = 0xE921, kGlyphMaximize = 0xE922,
+                  kGlyphFolder = 0xE8B7, kGlyphLogs = 0xE8A5, kGlyphInstall = 0xE896, kGlyphMinimize = 0xE921, kGlyphMaximize = 0xE922,
                   kGlyphRestore = 0xE923, kGlyphClose = 0xE8BB, kGlyphPrev = 0xE76B, kGlyphNext = 0xE76C;
 
 const wchar_t* const kPages[] = {L"Performance", L"Display", L"Network", L"Android", L"Tools", L"About"};
@@ -27,6 +27,7 @@ struct Resolution {
 const Resolution kResolutions[] = {{1280, 720}, {1600, 900}, {1920, 1080}, {720, 1280}, {1080, 1920}};
 const uint32_t kDpis[] = {160, 240, 320};
 const uint64_t kRamMb[] = {2048, 3072, 4096, 6144, 8192};
+const uint32_t kCpus[] = {1, 2, 4, 6, 8};
 
 template <typename T, size_t N, typename Eq>
 size_t IndexOf(const T (&options)[N], Eq eq) {
@@ -223,6 +224,8 @@ void ShellUi::DrawBars(HDC dc, const RECT& client) {
         y += bh;
     };
     side_btn(10, kGlyphFullscreen, L"Full screen (F11)", kUiFullscreen);
+    side_btn(15, kGlyphInstall, L"Install an app (.apk) or copy a file into Android - or drop it on the window",
+             kUiInstallApk);
     side_btn(11, kGlyphCamera, L"Save a screenshot", kUiScreenshot);
     side_btn(12, kGlyphConsole, L"Android console", kUiShowConsole);
     side_btn(13, kGlyphLogs, L"Collect logs into a zip", kUiCollectLogs);
@@ -339,7 +342,10 @@ void ShellUi::DrawSettings(HDC dc, const RECT& area) {
             choice(L"Memory for Android", std::to_wstring(edit_.ram_mb / 1024) + L" GB",
                    [this, i, step] { edit_.ram_mb = kRamMb[step(i, std::size(kRamMb), -1)]; },
                    [this, i, step] { edit_.ram_mb = kRamMb[step(i, std::size(kRamMb), 1)]; });
-            info(L"CPU cores: 1", L"Multi-core is not implemented yet, so there is nothing to choose here.");
+            const size_t c = IndexOf(kCpus, [&](uint32_t v) { return v == edit_.cpus; });
+            choice(L"CPU cores (more than 1 is experimental)", std::to_wstring(edit_.cpus),
+                   [this, c, step] { edit_.cpus = kCpus[step(c, std::size(kCpus), -1)]; },
+                   [this, c, step] { edit_.cpus = kCpus[step(c, std::size(kCpus), 1)]; });
             info(L"Graphics: software", L"Android draws everything on the CPU. GPU acceleration is not implemented yet.");
             break;
         }
@@ -373,6 +379,9 @@ void ShellUi::DrawSettings(HDC dc, const RECT& area) {
             button(L"Android console (serial)", L"Open", kUiShowConsole);
             button(L"Collect logs into a zip", L"Collect", kUiCollectLogs);
             button(L"Aetheron folder", L"Open", kUiOpenFolder);
+            button(L"Install an app (.apk) / copy a file", L"Choose file...", kUiInstallApk);
+            info(L"adb", L"Android is reachable from Windows with: adb connect 127.0.0.1:6520. Installing apps "
+                         L"needs adb.exe (Android platform-tools) in the tools folder next to Aetheron.exe.");
             break;
         default:
             info(L"Aetheron", L"Runs real Android in a virtual machine on the Windows Hypervisor Platform.");

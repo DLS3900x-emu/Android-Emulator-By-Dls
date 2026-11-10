@@ -7,6 +7,7 @@
 //   trace.log    - host-side VMM diagnostics
 #include <windows.h>
 #include <shellapi.h>
+#include <commdlg.h>
 #include <windowsx.h>
 
 #include <atomic>
@@ -40,6 +41,7 @@
 #include "disk/composite_disk.h"
 #include "disk/disk_config.h"
 #include "host/oemlock.h"
+#include "host/vsock_tcp_bridge.h"
 #include "ui/dx12_display.h"
 #include "ui/boot_stage.h"
 #include "ui/keymap.h"
@@ -114,6 +116,9 @@ struct App {
     VirtioInput* touch = nullptr;
     VirtioInput* keyboard = nullptr;
     VirtioNet* net = nullptr;
+    VirtioVsock* vsock = nullptr;
+    std::unique_ptr<VsockTcpBridge> adb_bridge;
+    std::atomic<bool> adb_busy{false};
     std::unique_ptr<OemLockResponder> oemlock;
     std::unique_ptr<PortDevice> reset_ports;
     std::thread shutdown_thread;
@@ -222,11 +227,13 @@ void LoadSettings() {
     g.s.bootconfig_file = Resolve(g.s.base_dir, g.s.bootconfig_file);
     g.s.setup_script = Resolve(g.s.base_dir, g.s.setup_script);
     g.s.cache_dir = g.s.cache_dir.empty() ? g.s.images_dir + L"\\aetheron_cache" : Resolve(g.s.base_dir, g.s.cache_dir);
-    if (g.s.cpus != 1) {
-        // Application processors need INIT/SIPI start-up handling that this
-        // VMM does not implement yet.
-        Log("settings: cpus=%u requested; only 1 vCPU is supported, using 1", g.s.cpus);
-        g.s.cpus = 1;
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    const uint32_t max_cpus = si.dwNumberOfProcessors < 8 ? si.dwNumberOfProcessors : 8;
+    if (g.s.cpus < 1) g.s.cpus = 1;
+    if (g.s.cpus > max_cpus) {
+        Log("settings: cpus=%u requested; this PC allows %u", g.s.cpus, max_cpus);
+        g.s.cpus = max_cpus;
     }
 }
 
@@ -521,7 +528,8 @@ bool SetupAndStart() {
         g.net = new VirtioNet(&g.mem, mac);
         add(kSlotNet, g.net);
     }
-    add(kSlotVsock, new VirtioVsock(&g.mem));
+    g.vsock = new VirtioVsock(&g.mem);
+    add(kSlotVsock, g.vsock);
 
     // 6. Firmware tables + kernel
     WriteMpTable(g.mem.low_host(), LinuxBootLayout::kMpTableGpa, g.s.cpus, ioapic_id, IoApic::kBase, pci_irqs);
@@ -538,6 +546,9 @@ bool SetupAndStart() {
     g.timer_thread = std::thread(TimerThread);
     g.vm.Start([](const std::string& reason) { SetStatus("guest stopped: " + reason); });
     if (g.net) g.net->StartNetwork();
+    // adbd in Cuttlefish listens on vsock port 5555; 6520 is Cuttlefish's usual host port for it.
+    g.adb_bridge = std::make_unique<VsockTcpBridge>(g.vsock, 6520, 5555);
+    g.adb_bridge->Start();
     SetStatus("guest running: waiting for kernel output");
     return true;
 }
@@ -625,11 +636,126 @@ void RequestWipe(HWND hwnd) {
                 L"Aetheron", MB_OK | MB_ICONINFORMATION);
 }
 
+// ---- Windows -> Android channel: adb over the vsock bridge ----
+const wchar_t kAdbSerial[] = L"127.0.0.1:6520";
+
+std::wstring FindAdb() {
+    for (const wchar_t* rel : {L"\\tools\\adb.exe", L"\\platform-tools\\adb.exe", L"\\adb.exe"})
+        if (FileExists(g.s.base_dir + rel)) return g.s.base_dir + rel;
+    wchar_t buf[MAX_PATH];
+    if (SearchPathW(nullptr, L"adb.exe", nullptr, MAX_PATH, buf, nullptr)) return buf;
+    return L"";
+}
+
+// Runs a console program without a window. Returns its exit code (-1 if it
+// could not run) and, when `output` is given, everything it printed.
+int RunHidden(std::wstring cmd, std::string* output, DWORD timeout_ms) {
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
+    HANDLE rd = nullptr, wr = nullptr;
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    if (output) {
+        if (!CreatePipe(&rd, &wr, &sa, 0)) return -1;
+        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = wr;
+        si.hStdError = wr;
+    }
+    PROCESS_INFORMATION pi = {};
+    const BOOL started = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, output != nullptr, CREATE_NO_WINDOW,
+                                        nullptr, nullptr, &si, &pi);
+    if (wr) CloseHandle(wr);
+    if (!started) {
+        if (rd) CloseHandle(rd);
+        return -1;
+    }
+    if (output) {
+        char buf[4096];
+        DWORD n = 0;
+        while (ReadFile(rd, buf, sizeof(buf), &n, nullptr) && n) output->append(buf, n);
+        CloseHandle(rd);
+    }
+    DWORD code = DWORD(-1);
+    if (WaitForSingleObject(pi.hProcess, timeout_ms) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+    else TerminateProcess(pi.hProcess, 1);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return int(code);
+}
+
+std::string LastLine(const std::string& text) {
+    std::istringstream ss(text);
+    std::string line, last;
+    while (std::getline(ss, line)) {
+        line = Trim(line);
+        if (!line.empty()) last = line;
+    }
+    return last;
+}
+
+// Installs .apk files and copies any other file into Android's Download
+// folder, using adb through the vsock bridge. Runs in the background.
+void AdbTransfer(std::vector<std::wstring> files) {
+    if (files.empty()) return;
+    if (g.adb_busy.exchange(true)) {
+        SetStatus("still busy with the previous install or copy");
+        return;
+    }
+    std::thread([files] {
+        struct Done {
+            ~Done() { g.adb_busy = false; }
+        } done;
+        const std::wstring adb = FindAdb();
+        if (adb.empty()) {
+            SetStatus("adb.exe not found - put Android platform-tools (adb.exe and its DLLs) into the tools folder "
+                      "next to Aetheron.exe");
+            return;
+        }
+        const std::wstring q = L"\"" + adb + L"\" ";
+        // Started without pipes: the adb server it leaves running must not inherit them.
+        RunHidden(q + L"start-server", nullptr, 30000);
+        std::string out;
+        RunHidden(q + L"connect " + kAdbSerial, &out, 30000);
+        if (out.find("connected") == std::string::npos) {
+            SetStatus("adb cannot reach Android yet (" + LastLine(out) + ") - try again once Android has booted");
+            return;
+        }
+        for (const std::wstring& file : files) {
+            const std::string name = Narrow(file.substr(file.find_last_of(L"\\/") + 1));
+            const bool apk = file.size() > 4 && _wcsicmp(file.c_str() + file.size() - 4, L".apk") == 0;
+            SetStatus((apk ? "installing " : "copying ") + name + " ...");
+            out.clear();
+            const std::wstring cmd = q + L"-s " + kAdbSerial + (apk ? L" install -r \"" : L" push \"") + file + L"\"" +
+                                     (apk ? L"" : L" /sdcard/Download/");
+            const int code = RunHidden(cmd, &out, INFINITE);
+            const bool ok = code == 0 && (!apk || out.find("Success") != std::string::npos);
+            Log("adb: %s %s: exit %d: %s", apk ? "install" : "push", name.c_str(), code, LastLine(out).c_str());
+            if (ok) SetStatus((apk ? "installed " : "copied to Android's Download folder: ") + name);
+            else SetStatus((apk ? "install failed: " : "copy failed: ") + name + " - " + LastLine(out));
+            if (!ok) return;
+        }
+    }).detach();
+}
+
+void PickAndInstall(HWND hwnd) {
+    wchar_t buf[2048] = L"";
+    OPENFILENAMEW o = {};
+    o.lStructSize = sizeof(o);
+    o.hwndOwner = hwnd;
+    o.lpstrFilter = L"Android apps (*.apk)\0*.apk\0All files\0*.*\0";
+    o.lpstrFile = buf;
+    o.nMaxFile = 2048;
+    o.lpstrTitle = L"Install an app or copy a file into Android";
+    o.Flags = OFN_FILEMUSTEXIST | OFN_EXPLORER | OFN_HIDEREADONLY;
+    if (GetOpenFileNameW(&o)) AdbTransfer({buf});
+}
+
 // Writes the settings page's values into aetheron.ini, keeping comments and
 // every other line as they are.
 bool SaveSettingsToIni(const UiSettings& u) {
     const std::vector<std::pair<std::string, std::string>> values = {
         {"ram_mb", std::to_string(u.ram_mb)},
+        {"cpus", std::to_string(u.cpus)},
         {"display_width", std::to_string(u.width)},
         {"display_height", std::to_string(u.height)},
         {"display_dpi", std::to_string(u.dpi)},
@@ -838,6 +964,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             break;
+        case WM_DROPFILES: {
+            HDROP drop = HDROP(wp);
+            std::vector<std::wstring> files;
+            const UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+            for (UINT i = 0; i < n; ++i) {
+                wchar_t path[1024];
+                if (DragQueryFileW(drop, i, path, 1024)) files.push_back(path);
+            }
+            DragFinish(drop);
+            AdbTransfer(files);
+            return 0;
+        }
         case WM_APP_LAYOUT:
             g.view_w = uint32_t(wp);
             g.view_h = uint32_t(lp);
@@ -889,6 +1027,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case kUiHome: TapKey(172); return 0;     // KEY_HOMEPAGE
                 case kUiRecents: TapKey(580); return 0;  // KEY_APPSELECT
                 case kUiFullscreen: ToggleFullscreen(); return 0;
+                case kUiInstallApk: PickAndInstall(hwnd); return 0;
                 case kUiScreenshot: SaveScreenshot(); return 0;
                 case kUiSettings: ToggleSettings(); return 0;
                 case kUiSaveSettings:
@@ -942,6 +1081,7 @@ LRESULT CALLBACK ViewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return WndProc(hwnd, msg, wp, lp);
         case WM_MOUSEMOVE:
         case WM_LBUTTONUP:
+        case WM_DROPFILES:
             return WndProc(hwnd, msg, wp, lp);
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -998,6 +1138,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (!g.hwnd) return 1;
     g.ui.Attach(g.hwnd);
     g.pending.ram_mb = g.s.ram_mb;
+    g.pending.cpus = g.s.cpus;
     g.pending.width = g.s.width;
     g.pending.height = g.s.height;
     g.pending.dpi = g.s.dpi;
@@ -1020,6 +1161,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g.view = CreateWindowExW(0, vc.lpszClassName, L"", WS_CHILD | WS_VISIBLE, 0, 0, 16, 16, g.hwnd, nullptr, inst, nullptr);
     if (!g.view) return 1;
     LayoutView();
+    DragAcceptFiles(g.hwnd, TRUE);
+    DragAcceptFiles(g.view, TRUE);
     g.display.SetLayoutNotify(g.hwnd, WM_APP_LAYOUT);
     UpdateSplash("starting");
     if (!g.display.Initialize(g.view, g.s.width, g.s.height, &err)) {

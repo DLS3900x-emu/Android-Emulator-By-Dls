@@ -53,6 +53,7 @@ private:
     void VcpuThread(uint32_t index);
     bool HandleExit(uint32_t index, const WHV_RUN_VP_EXIT_CONTEXT& ctx, std::string* stop_reason);
     void HandleCpuid(uint32_t index, const WHV_RUN_VP_EXIT_CONTEXT& ctx);
+    void HandleInitSipi(uint32_t index, uint64_t icr);
 
     // WinHvEmulation callbacks
     static HRESULT CALLBACK EmuIoPort(void* ctx, WHV_EMULATOR_IO_ACCESS_INFO* io);
@@ -70,7 +71,7 @@ private:
     void MmioWrite(uint64_t gpa, uint8_t size, uint64_t value);
 
     WHV_PARTITION_HANDLE partition_ = nullptr;
-    WHV_EMULATOR_HANDLE emulator_ = nullptr;
+    std::vector<WHV_EMULATOR_HANDLE> emulators_;  // one per vCPU: an emulator is not shared between threads
     GuestMemory* mem_ = nullptr;
     uint32_t cpu_count_ = 1;
     std::map<uint16_t, PortDevice*> ports_;

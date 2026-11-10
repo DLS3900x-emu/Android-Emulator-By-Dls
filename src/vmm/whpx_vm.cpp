@@ -16,7 +16,8 @@ std::string Hex(HRESULT hr) {
 
 WhpxVm::~WhpxVm() {
     Stop();
-    if (emulator_) WHvEmulatorDestroyEmulator(emulator_);
+    for (WHV_EMULATOR_HANDLE e : emulators_)
+        if (e) WHvEmulatorDestroyEmulator(e);
     if (partition_) WHvDeletePartition(partition_);
 }
 
@@ -61,7 +62,15 @@ bool WhpxVm::Create(uint32_t cpu_count, GuestMemory* mem) {
     }
     std::memset(&p, 0, sizeof(p));
     p.ExtendedVmExits.X64CpuidExit = 1;
+    // Secondary CPUs are started by the guest with INIT/SIPI messages; with the
+    // APIC inside the hypervisor those are reported to us to pass on.
+    p.ExtendedVmExits.X64ApicInitSipiExitTrap = cpu_count > 1 ? 1 : 0;
     hr = WHvSetPartitionProperty(partition_, WHvPartitionPropertyCodeExtendedVmExits, &p, sizeof(p));
+    if (FAILED(hr) && cpu_count > 1) {
+        Log("whpx: INIT/SIPI exits unavailable %s; secondary CPUs may not start", Hex(hr).c_str());
+        p.ExtendedVmExits.X64ApicInitSipiExitTrap = 0;
+        hr = WHvSetPartitionProperty(partition_, WHvPartitionPropertyCodeExtendedVmExits, &p, sizeof(p));
+    }
     if (FAILED(hr)) {
         Log("whpx: set ExtendedVmExits failed %s", Hex(hr).c_str());
         return false;
@@ -99,6 +108,14 @@ bool WhpxVm::Create(uint32_t cpu_count, GuestMemory* mem) {
             Log("whpx: create vCPU %u failed %s", i, Hex(hr).c_str());
             return false;
         }
+        if (i > 0) {
+            // Like on a real PC, only CPU 0 runs after power-on; the others wait for a start-up IPI.
+            WHV_REGISTER_NAME name = WHvRegisterInternalActivityState;
+            WHV_REGISTER_VALUE value = {};
+            value.InternalActivity.StartupSuspend = 1;
+            hr = WHvSetVirtualProcessorRegisters(partition_, i, &name, 1, &value);
+            if (FAILED(hr)) Log("whpx: vCPU %u: cannot set wait-for-SIPI state %s", i, Hex(hr).c_str());
+        }
     }
 
     WHV_EMULATOR_CALLBACKS cb = {};
@@ -108,11 +125,15 @@ bool WhpxVm::Create(uint32_t cpu_count, GuestMemory* mem) {
     cb.WHvEmulatorGetVirtualProcessorRegisters = EmuGetRegs;
     cb.WHvEmulatorSetVirtualProcessorRegisters = EmuSetRegs;
     cb.WHvEmulatorTranslateGvaPage = EmuTranslateGva;
-    hr = WHvEmulatorCreateEmulator(&cb, &emulator_);
-    if (FAILED(hr)) {
-        Log("whpx: WHvEmulatorCreateEmulator failed %s", Hex(hr).c_str());
-        return false;
+    emulators_.assign(cpu_count, nullptr);
+    for (uint32_t i = 0; i < cpu_count; ++i) {
+        hr = WHvEmulatorCreateEmulator(&cb, &emulators_[i]);
+        if (FAILED(hr)) {
+            Log("whpx: WHvEmulatorCreateEmulator failed %s", Hex(hr).c_str());
+            return false;
+        }
     }
+    Log("whpx: %u vCPU%s", cpu_count, cpu_count == 1 ? "" : "s");
     return true;
 }
 
@@ -226,8 +247,44 @@ void WhpxVm::VcpuThread(uint32_t index) {
         reason = "stopped by user";
     }
     Log("vcpu%u: stopped: %s", index, reason.c_str());
+    if (index != 0) return;  // losing a secondary CPU costs the guest that core, not the whole VM
+    if (!stop_requested_) {
+        // The boot CPU is gone: let the other vCPU threads leave their run loops too.
+        stop_requested_ = true;
+        for (uint32_t i = 1; i < cpu_count_; ++i) WHvCancelRunVirtualProcessor(partition_, i, 0);
+    }
     running_ = false;
     if (on_stop_) on_stop_(reason);
+}
+
+// The guest wrote an INIT or start-up IPI to its APIC: deliver it to the
+// addressed CPU(s), which the hypervisor then resets / starts.
+void WhpxVm::HandleInitSipi(uint32_t index, uint64_t icr) {
+    const uint32_t mode = uint32_t(icr >> 8) & 7, shorthand = uint32_t(icr >> 18) & 3;
+    if (mode != 5 && mode != 6) return;  // only INIT (5) and SIPI (6) are trapped
+    WHV_INTERRUPT_CONTROL ipi = {};
+    ipi.Type = mode == 5 ? WHvX64InterruptTypeInit : WHvX64InterruptTypeSipi;
+    ipi.DestinationMode = (icr >> 11) & 1 ? WHvX64InterruptDestinationModeLogical
+                                         : WHvX64InterruptDestinationModePhysical;
+    ipi.TriggerMode = (icr >> 15) & 1 ? WHvX64InterruptTriggerModeLevel : WHvX64InterruptTriggerModeEdge;
+    ipi.Vector = uint32_t(icr & 0xFF);
+    auto send = [&](uint32_t dest) {
+        ipi.Destination = dest;
+        HRESULT hr = WHvRequestInterrupt(partition_, &ipi, sizeof(ipi));
+        if (FAILED(hr))
+            LogOnce("sipi-fail-" + std::to_string(dest), "whpx: %s to CPU %u failed %s", mode == 5 ? "INIT" : "SIPI",
+                    dest, Hex(hr).c_str());
+    };
+    if (shorthand == 0) {
+        send(uint32_t(icr >> 56) & 0xFF);
+        return;
+    }
+    // Shorthands: 1 = self, 2 = all, 3 = all but self. APIC ids equal vCPU indexes here.
+    for (uint32_t i = 0; i < cpu_count_; ++i) {
+        const bool self = i == index;
+        if ((shorthand == 1 && !self) || (shorthand == 3 && self)) continue;
+        send(i);
+    }
 }
 
 void WhpxVm::HandleCpuid(uint32_t index, const WHV_RUN_VP_EXIT_CONTEXT& ctx) {
@@ -241,6 +298,7 @@ void WhpxVm::HandleCpuid(uint32_t index, const WHV_RUN_VP_EXIT_CONTEXT& ctx) {
         rcx &= ~(1ULL << 31);  // no hypervisor interface is offered to the guest (see below)
         rbx = (rbx & 0x0000FFFFULL) | (uint64_t(cpu_count_) << 16) | (uint64_t(index) << 24);
         rdx |= 1ULL << 9;      // APIC present
+        if (cpu_count_ > 1) rdx |= 1ULL << 28;  // HTT: more than one logical processor in the package
     } else if (leaf == 0xB || leaf == 0x1F) {
         rdx = index;           // x2APIC id must match the APIC id in the MP table
     } else if (leaf >= 0x40000000 && leaf <= 0x40000010) {
@@ -264,7 +322,7 @@ bool WhpxVm::HandleExit(uint32_t index, const WHV_RUN_VP_EXIT_CONTEXT& ctx, std:
     WHV_EMULATOR_STATUS st;
     switch (ctx.ExitReason) {
         case WHvRunVpExitReasonX64IoPortAccess: {
-            HRESULT hr = WHvEmulatorTryIoEmulation(emulator_, &vpc, &ctx.VpContext, &ctx.IoPortAccess, &st);
+            HRESULT hr = WHvEmulatorTryIoEmulation(emulators_[index], &vpc, &ctx.VpContext, &ctx.IoPortAccess, &st);
             if (FAILED(hr) || !st.EmulationSuccessful) {
                 *reason = "I/O emulation failed at port 0x" + std::to_string(ctx.IoPortAccess.PortNumber) +
                           " status=" + Hex(HRESULT(st.AsUINT32));
@@ -273,7 +331,7 @@ bool WhpxVm::HandleExit(uint32_t index, const WHV_RUN_VP_EXIT_CONTEXT& ctx, std:
             return true;
         }
         case WHvRunVpExitReasonMemoryAccess: {
-            HRESULT hr = WHvEmulatorTryMmioEmulation(emulator_, &vpc, &ctx.VpContext, &ctx.MemoryAccess, &st);
+            HRESULT hr = WHvEmulatorTryMmioEmulation(emulators_[index], &vpc, &ctx.VpContext, &ctx.MemoryAccess, &st);
             if (FAILED(hr) || !st.EmulationSuccessful) {
                 char b[160];
                 snprintf(b, sizeof(b), "MMIO emulation failed at GPA 0x%llx RIP 0x%llx status=0x%x",
@@ -284,6 +342,9 @@ bool WhpxVm::HandleExit(uint32_t index, const WHV_RUN_VP_EXIT_CONTEXT& ctx, std:
             }
             return true;
         }
+        case WHvRunVpExitReasonX64ApicInitSipiTrap:
+            HandleInitSipi(index, ctx.ApicInitSipi.ApicIcr);
+            return true;
         case WHvRunVpExitReasonX64Cpuid:
             HandleCpuid(index, ctx);
             return true;

@@ -27,15 +27,17 @@ enum UiCmd : UINT {
     kUiMinimize,
     kUiMaximize,
     kUiSaveSettings,
+    kUiInstallApk,
 };
 
 // The values the settings page edits. All of them are read at start-up.
 struct UiSettings {
     uint64_t ram_mb = 4096;
+    uint32_t cpus = 1;
     uint32_t width = 1280, height = 720, dpi = 160;
     bool network = true, boot_splash = true, first_boot_setup = true;
     bool operator==(const UiSettings& o) const {
-        return ram_mb == o.ram_mb && width == o.width && height == o.height && dpi == o.dpi && network == o.network &&
+        return ram_mb == o.ram_mb && cpus == o.cpus && width == o.width && height == o.height && dpi == o.dpi && network == o.network &&
                boot_splash == o.boot_splash && first_boot_setup == o.first_boot_setup;
     }
 };
