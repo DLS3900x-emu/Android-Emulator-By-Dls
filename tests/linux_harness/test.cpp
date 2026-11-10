@@ -16,6 +16,7 @@
 #include "devices/virtio_vsock.h"
 #include "host/oemlock.h"
 #include "host/adb_client.h"
+#include "host/zip_reader.h"
 #include <deque>
 #include <algorithm>
 #include "ui/keymapper.h"
@@ -322,6 +323,22 @@ int main(){
     CHECK(cmd({0x0105,0,0,0,0,0, 0,0,8,6, 0,0, 5,0})==OK); CHECK(cmd({0x0104,0,0,0,0,0, 2,1,4,5, 5,0})==OK);
     CHECK(so.frame==f+1 && so.bgra[2*8+3]==0xFF990203u && so.height==4);
     printf("virtio-gpu scanout rectangle OK\n"); }
+  // ---- zip reader (used for .xapk bundles) ----
+  { ZipReader zip; std::string e;
+    CHECK(zip.Open(L"imgs/bundle.xapk", &e)); CHECK(zip.entries().size()==6);
+    auto get=[&](const char* name, std::string* out){ for (auto& en : zip.entries()) if (en.name==name) { out->clear(); return zip.Extract(en,[&](const uint8_t* d,size_t n){ out->append((const char*)d,n); return true; },&e); } return false; };
+    std::string got; auto want=[&](const char* f){ auto v=rd(f); return std::string(v.begin(),v.end()); };
+    CHECK(get("base.apk",&got)); CHECK(got==want("imgs/zip_base"));                          // stored
+    CHECK(get("config.x86_64.apk",&got)); CHECK(got==want("imgs/zip_text"));                 // deflated, long matches
+    CHECK(get("config.arm64_v8a.apk",&got)); CHECK(got==want("imgs/zip_mixed"));             // deflated, > 32 KiB window
+    CHECK(get("Android/obb/com.example.game/main.1.com.example.game.obb",&got)); CHECK(got==want("imgs/zip_random"));
+    CHECK(get("empty.apk",&got)); CHECK(got.empty());
+    CHECK(zip.ExtractToFile(zip.entries()[1], L"imgs/zip_out", &e)); CHECK(rd("imgs/zip_out")==rd("imgs/zip_text"));
+    ZipReader bad; CHECK(bad.Open(L"imgs/bundle_bad.xapk", &e));                             // one flipped byte in the data
+    bool failed=false; for (auto& en : bad.entries()) if (en.name=="config.x86_64.apk") failed=!bad.Extract(en,[](const uint8_t*,size_t){ return true; },&e);
+    CHECK(failed); CHECK(e.find("damaged")!=std::string::npos);
+    ZipReader nozip; CHECK(!nozip.Open(L"imgs/odd.img", &e));
+    printf("zip reader OK\n"); }
   // ---- all 30 PCI slots used by the emulator fit on the bus ----
   { Irq irq; PciBus bus(&irq); GuestMemory mem; CHECK(mem.Allocate(1<<20)); std::vector<std::unique_ptr<VirtioConsole>> cs;
     for (uint8_t s=1;s<=26;++s){ cs.emplace_back(new VirtioConsole(&mem, "")); bus.AddDevice(s, cs.back().get(), 16+(s%8)); }

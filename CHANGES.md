@@ -1,3 +1,16 @@
+# v15
+
+- **.xapk install** (also .apks / .apkm): Aetheron unpacks the bundle itself,
+  installs the base app together with its split parts as one app, and copies
+  game data (`Android/obb/...`) to where the app looks for it. Use the
+  *Install an app* button or drop the file on the window.
+- Split parts for other CPU types are left out. If an app only exists for
+  ARM phones, the install stops with a plain message: this Android image
+  runs x86_64 apps only (there is no ARM translation layer).
+
+Tested here: the zip reader (stored, deflated, damaged data) in the harness
+and a clean Windows cross-build. Not tested: an actual .xapk install.
+
 # v14
 
 - **No more black strip under the Android screen.** Android's framebuffer is

@@ -43,6 +43,7 @@
 #include "host/adb_client.h"
 #include "host/oemlock.h"
 #include "host/vsock_stream.h"
+#include "host/zip_reader.h"
 #include "host/vsock_tcp_bridge.h"
 #include "ui/dx12_display.h"
 #include "ui/boot_stage.h"
@@ -713,55 +714,251 @@ bool WaitAndroidReady(int seconds) {
     return false;
 }
 
-// Streams an .apk to Android's package installer. `message` gets its answer.
-bool AdbInstall(AdbClient& adb, const std::wstring& file, std::string* message) {
+// Streams a host file into an adbd service's standard input.
+bool AdbSendFile(AdbClient& adb, const std::string& service, const std::wstring& file, std::string* out,
+                 std::string* message) {
     FILE* f = _wfopen(file.c_str(), L"rb");
     if (!f) {
         *message = "cannot open the file";
         return false;
     }
-    _fseeki64(f, 0, SEEK_END);
-    const int64_t size = _ftelli64(f);
-    _fseeki64(f, 0, SEEK_SET);
-    std::string out, err;
-    const bool ran = adb.Run("exec:cmd package install -r -S " + std::to_string(size),
-                             [f](uint8_t* buf, size_t max) { return fread(buf, 1, max, f); }, &out, &err);
+    std::string err;
+    const bool ran = adb.Run(service, [f](uint8_t* buf, size_t max) { return fread(buf, 1, max, f); }, out, &err);
     fclose(f);
-    *message = ran ? LastLine(out) : err;
-    return ran && out.find("Success") != std::string::npos;
+    if (!ran) *message = err;
+    return ran;
+}
+
+int64_t HostFileSize(const std::wstring& file) {
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &d)) return -1;
+    return (int64_t(d.nFileSizeHigh) << 32) | d.nFileSizeLow;
+}
+
+// Explains the installer's most common refusal in plain words.
+std::string ExplainInstallError(const std::string& msg) {
+    if (msg.find("NO_MATCHING_ABIS") != std::string::npos)
+        return "this app is built only for ARM phones; this Android image runs x86_64 apps only";
+    return msg;
+}
+
+// Installs one app from one or more .apk files (base + split parts) through
+// a package-installer session, like `adb install-multiple`.
+bool AdbInstallApks(AdbClient& adb, const std::vector<std::wstring>& apks, std::string* message) {
+    int64_t total = 0;
+    for (const std::wstring& a : apks) {
+        const int64_t n = HostFileSize(a);
+        if (n < 0) {
+            *message = "cannot open the file";
+            return false;
+        }
+        total += n;
+    }
+    std::string out, err;
+    if (apks.size() == 1) {
+        // A single file needs no session: stream it straight to the installer.
+        if (!AdbSendFile(adb, "exec:cmd package install -r -S " + std::to_string(total), apks[0], &out, message))
+            return false;
+        *message = ExplainInstallError(LastLine(out));
+        return out.find("Success") != std::string::npos;
+    }
+    if (!adb.Shell("cmd package install-create -r -S " + std::to_string(total), &out, &err)) {
+        *message = err;
+        return false;
+    }
+    const size_t open = out.find('['), close = out.find(']');
+    if (out.find("Success") == std::string::npos || open == std::string::npos || close == std::string::npos ||
+        close <= open + 1) {
+        *message = LastLine(out);
+        return false;
+    }
+    const std::string session = out.substr(open + 1, close - open - 1);
+    for (char c : session)
+        if (c < '0' || c > '9') {
+            *message = "unexpected answer from Android's installer";
+            return false;
+        }
+    bool ok = true;
+    for (size_t i = 0; i < apks.size() && ok; ++i) {
+        out.clear();
+        ok = AdbSendFile(adb,
+                         "exec:cmd package install-write -S " + std::to_string(HostFileSize(apks[i])) + " " + session +
+                             " " + std::to_string(i) + ".apk -",
+                         apks[i], &out, message);
+        if (ok && out.find("Success") == std::string::npos) {
+            *message = LastLine(out);
+            ok = false;
+        }
+    }
+    out.clear();
+    if (ok) {
+        ok = adb.Shell("cmd package install-commit " + session, &out, &err) && out.find("Success") != std::string::npos;
+        if (!ok) *message = out.empty() ? err : LastLine(out);
+    } else {
+        adb.Shell("cmd package install-abandon " + session, &out, &err);
+    }
+    if (!ok) *message = ExplainInstallError(*message);
+    return ok;
+}
+
+// Copies a host file to a path inside Android (which must be safe to put in single quotes).
+bool AdbCopyTo(AdbClient& adb, const std::wstring& file, const std::string& guest_path, std::string* message) {
+    const int64_t size = HostFileSize(file);
+    if (size < 0) {
+        *message = "cannot open the file";
+        return false;
+    }
+    std::string out;
+    // head stops after exactly `size` bytes, so the stream needs no end marker.
+    if (!AdbSendFile(adb, "exec:head -c " + std::to_string(size) + " > '" + guest_path + "' && echo aetheron-copied",
+                     file, &out, message))
+        return false;
+    if (out.find("aetheron-copied") == std::string::npos) {
+        *message = LastLine(out);
+        return false;
+    }
+    return true;
+}
+
+// Keeps only characters that are safe inside single quotes in Android's shell.
+std::string SafeName(const std::string& name) {
+    std::string s;
+    for (unsigned char c : name)
+        s.push_back((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' ||
+                            c == '_'
+                        ? char(c)
+                        : '_');
+    if (s.empty() || s[0] == '.') s = "file" + s;
+    return s;
 }
 
 // Copies any other file into Android's Download folder.
 bool AdbCopyToDownloads(AdbClient& adb, const std::wstring& file, std::string* message) {
-    FILE* f = _wfopen(file.c_str(), L"rb");
-    if (!f) {
-        *message = "cannot open the file";
-        return false;
-    }
-    _fseeki64(f, 0, SEEK_END);
-    const int64_t size = _ftelli64(f);
-    _fseeki64(f, 0, SEEK_SET);
-    // The name goes through Android's shell: keep only characters that are safe there.
-    std::string name;
-    for (wchar_t c : file.substr(file.find_last_of(L"\\/") + 1))
-        name.push_back((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') || c == L'.' ||
-                               c == L'-' || c == L'_'
-                           ? char(c)
-                           : '_');
-    if (name.empty() || name[0] == '.') name = "file" + name;
-    std::string out, err;
-    // head stops after exactly `size` bytes, so the stream needs no end marker.
-    const bool ran = adb.Run("exec:head -c " + std::to_string(size) + " > '/sdcard/Download/" + name +
-                                 "' && echo aetheron-copied",
-                             [f](uint8_t* buf, size_t max) { return fread(buf, 1, max, f); }, &out, &err);
-    fclose(f);
-    const bool ok = ran && out.find("aetheron-copied") != std::string::npos;
-    *message = ok ? name : ran ? LastLine(out) : err;
-    return ok;
+    const std::string name = SafeName(Narrow(file.substr(file.find_last_of(L"\\/") + 1)));
+    if (!AdbCopyTo(adb, file, "/sdcard/Download/" + name, message)) return false;
+    *message = name;
+    return true;
 }
 
-// Installs .apk files and copies any other file into Android's Download
-// folder. Runs in the background; progress is shown in the top bar.
+// An .xapk (also .apks / .apkm) is a zip with the app's base .apk, its split
+// parts and sometimes game data (Android/obb/<package>/*.obb). The parts are
+// unpacked into a temporary folder, installed as one app, and the game data
+// is copied to where the app looks for it.
+bool AdbInstallBundle(AdbClient& adb, const std::wstring& file, std::string* message) {
+    ZipReader zip;
+    if (!zip.Open(file, message)) return false;
+
+    std::string abis, err;
+    adb.Shell("getprop ro.product.cpu.abilist", &abis, &err);
+    abis = "," + Trim(abis) + ",";
+    // Split parts carrying native code are named config.<abi>.apk; parts for other CPUs are left out.
+    static const char* const kAbis[][2] = {{"arm64_v8a", "arm64-v8a"}, {"armeabi_v7a", "armeabi-v7a"},
+                                           {"armeabi", "armeabi"},     {"x86_64", "x86_64"},
+                                           {"x86", "x86"},             {"mips64", "mips64"},
+                                           {"mips", "mips"}};
+    std::vector<const ZipEntry*> apks, obbs;
+    bool abi_parts = false, abi_match = false;
+    for (const ZipEntry& e : zip.entries()) {
+        if (e.name.empty() || e.name.back() == '/') continue;
+        std::string lower;
+        for (char c : e.name) lower.push_back(c >= 'A' && c <= 'Z' ? char(c + 32) : c);
+        if (lower.rfind("android/obb/", 0) == 0) {
+            obbs.push_back(&e);
+            continue;
+        }
+        if (lower.size() < 5 || lower.compare(lower.size() - 4, 4, ".apk") != 0) continue;
+        const std::string base = lower.substr(lower.find_last_of('/') + 1);
+        const size_t cfg = base.find("config.");
+        bool skip = false;
+        if (cfg != std::string::npos) {
+            const std::string token = base.substr(cfg + 7, base.size() - cfg - 7 - 4);
+            for (const auto& abi : kAbis)
+                if (token == abi[0]) {
+                    abi_parts = true;
+                    if (abis.find(std::string(",") + abi[1] + ",") != std::string::npos) abi_match = true;
+                    else skip = true;
+                }
+        }
+        if (!skip) apks.push_back(&e);
+    }
+    if (apks.empty()) {
+        *message = "no .apk found inside the file";
+        return false;
+    }
+    if (abi_parts && !abi_match) {
+        *message = ExplainInstallError("NO_MATCHING_ABIS");
+        return false;
+    }
+
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    const std::wstring dir = std::wstring(tmp) + L"aetheron_bundle_" + std::to_wstring(GetTickCount64());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::vector<std::wstring> temp_files;
+    auto cleanup = [&] {
+        for (const std::wstring& f : temp_files) DeleteFileW(f.c_str());
+        RemoveDirectoryW(dir.c_str());
+    };
+    auto unpack = [&](const ZipEntry& e, std::wstring* out_path) {
+        *out_path = dir + L"\\" + std::to_wstring(temp_files.size());
+        temp_files.push_back(*out_path);
+        return zip.ExtractToFile(e, *out_path, message);
+    };
+
+    std::vector<std::wstring> apk_files;
+    for (size_t i = 0; i < apks.size(); ++i) {
+        SetStatus("unpacking part " + std::to_string(i + 1) + " of " + std::to_string(apks.size()) + " ...");
+        std::wstring path;
+        if (!unpack(*apks[i], &path)) {
+            cleanup();
+            return false;
+        }
+        apk_files.push_back(path);
+    }
+    SetStatus("installing (" + std::to_string(apks.size()) + " parts) ...");
+    if (!AdbInstallApks(adb, apk_files, message)) {
+        cleanup();
+        return false;
+    }
+
+    // Game data. Path parts go through Android's shell, so only plain names are accepted.
+    int copied = 0, skipped = 0;
+    for (const ZipEntry* e : obbs) {
+        const std::string rest = e->name.substr(12);  // after "Android/obb/"
+        const size_t slash = rest.find('/');
+        const std::string pkg = slash == std::string::npos ? "" : rest.substr(0, slash);
+        const std::string name = slash == std::string::npos ? "" : rest.substr(slash + 1);
+        if (pkg.empty() || name.empty() || SafeName(pkg) != pkg || SafeName(name) != name) {
+            Log("adb: skipped game data with an unusual name: %s", e->name.c_str());
+            ++skipped;
+            continue;
+        }
+        SetStatus("copying game data " + name + " ...");
+        std::wstring path;
+        std::string out;
+        const bool ok = unpack(*e, &path) && adb.Shell("mkdir -p '/sdcard/Android/obb/" + pkg + "'", &out, &err) &&
+                        AdbCopyTo(adb, path, "/sdcard/Android/obb/" + pkg + "/" + name, message);
+        DeleteFileW(path.c_str());
+        if (!ok) {
+            cleanup();
+            *message = "the app is installed, but copying its game data failed: " + *message;
+            return false;
+        }
+        ++copied;
+    }
+    cleanup();
+    *message = std::to_string(apks.size()) + " parts" + (copied ? ", " + std::to_string(copied) + " game data files" : "") +
+               (skipped ? ", " + std::to_string(skipped) + " data files skipped" : "");
+    return true;
+}
+
+bool HasExtension(const std::wstring& file, const wchar_t* ext) {
+    const size_t n = wcslen(ext);
+    return file.size() > n && _wcsicmp(file.c_str() + file.size() - n, ext) == 0;
+}
+
+// Installs .apk / .xapk files and copies any other file into Android's
+// Download folder. Runs in the background; progress is shown in the top bar.
 void AdbTransfer(std::vector<std::wstring> files) {
     if (files.empty()) return;
     if (g.adb_busy.exchange(true)) {
@@ -784,16 +981,22 @@ void AdbTransfer(std::vector<std::wstring> files) {
         }
         for (const std::wstring& file : files) {
             const std::string name = Narrow(file.substr(file.find_last_of(L"\\/") + 1));
-            const bool apk = file.size() > 4 && _wcsicmp(file.c_str() + file.size() - 4, L".apk") == 0;
-            SetStatus((apk ? "installing " : "copying ") + name + " ...");
+            const bool apk = HasExtension(file, L".apk");
+            const bool bundle = HasExtension(file, L".xapk") || HasExtension(file, L".apks") || HasExtension(file, L".apkm");
+            SetStatus((apk || bundle ? "installing " : "copying ") + name + " ...");
             std::string msg;
-            const bool ok = apk ? AdbInstall(s.adb, file, &msg) : AdbCopyToDownloads(s.adb, file, &msg);
-            Log("adb: %s %s: %s (%s)", apk ? "install" : "copy", name.c_str(), ok ? "ok" : "FAILED", msg.c_str());
+            const bool ok = apk      ? AdbInstallApks(s.adb, {file}, &msg)
+                            : bundle ? AdbInstallBundle(s.adb, file, &msg)
+                                     : AdbCopyToDownloads(s.adb, file, &msg);
+            Log("adb: %s %s: %s (%s)", apk || bundle ? "install" : "copy", name.c_str(), ok ? "ok" : "FAILED",
+                msg.c_str());
             if (!ok) {
-                SetStatus((apk ? "install failed: " : "copy failed: ") + name + " - " + msg);
+                SetStatus((apk || bundle ? "install failed: " : "copy failed: ") + name + " - " + msg);
                 return;
             }
-            SetStatus(apk ? "installed " + name : "copied to Android's Download folder as " + msg);
+            SetStatus(apk      ? "installed " + name
+                      : bundle ? "installed " + name + " (" + msg + ")"
+                               : "copied to Android's Download folder as " + msg);
         }
     }).detach();
 }
@@ -803,7 +1006,7 @@ void PickAndInstall(HWND hwnd) {
     OPENFILENAMEW o = {};
     o.lStructSize = sizeof(o);
     o.hwndOwner = hwnd;
-    o.lpstrFilter = L"Android apps (*.apk)\0*.apk\0All files\0*.*\0";
+    o.lpstrFilter = L"Android apps (*.apk, *.xapk)\0*.apk;*.xapk;*.apks;*.apkm\0All files\0*.*\0";
     o.lpstrFile = buf;
     o.nMaxFile = 2048;
     o.lpstrTitle = L"Install an app or copy a file into Android";
@@ -867,12 +1070,12 @@ void ProvisionLauncher() {
 
     SetStatus("installing the Aetheron home screen...");
     std::string msg;
-    bool ok = AdbInstall(s.adb, apk, &msg);
+    bool ok = AdbInstallApks(s.adb, {apk}, &msg);
     if (!ok && msg.find("INSTALL_FAILED_UPDATE_INCOMPATIBLE") != std::string::npos) {
         // An older build signed with another key: replace it.
         out.clear();
         s.adb.Shell(std::string("pm uninstall ") + kLauncherPackage, &out, &err);
-        ok = AdbInstall(s.adb, apk, &msg);
+        ok = AdbInstallApks(s.adb, {apk}, &msg);
     }
     if (!ok) {
         Log("launcher: install failed: %s", msg.c_str());

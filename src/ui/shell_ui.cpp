@@ -427,7 +427,7 @@ void ShellUi::DrawBars(HDC dc, const RECT& client) {
     };
     side_btn(10, kGlyphFullscreen, L"Full screen (F11)", kUiFullscreen);
     side_btn(15, kGlyphKeyboard, L"Game controls: play with the keyboard", kUiControls);
-    side_btn(16, kIconInstall, L"Install an app (.apk) or copy a file into Android - or drop it on the window",
+    side_btn(16, kIconInstall, L"Install an app (.apk, .xapk) or copy a file into Android - or drop it on the window",
              kUiInstallApk);
     side_btn(11, kGlyphCamera, L"Save a screenshot", kUiScreenshot);
     side_btn(12, kGlyphConsole, L"Android console", kUiShowConsole);
@@ -591,7 +591,7 @@ void ShellUi::DrawSettings(HDC dc, const RECT& area) {
             button(L"Android console (serial)", L"Open", kUiShowConsole, row_h, ctl_w);
             button(L"Collect logs into a zip", L"Collect", kUiCollectLogs, row_h, ctl_w);
             button(L"Aetheron folder", L"Open", kUiOpenFolder, row_h, ctl_w);
-            button(L"Install an app (.apk) / copy a file", L"Choose file...", kUiInstallApk, row_h, ctl_w);
+            button(L"Install an app (.apk, .xapk) / copy a file", L"Choose file...", kUiInstallApk, row_h, ctl_w);
             break;
         default:
             saved_page = false;

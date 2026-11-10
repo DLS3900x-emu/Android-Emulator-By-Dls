@@ -85,3 +85,18 @@ open(f'{d}/ramdisk.lz4','wb').write(lz4_legacy(a1,blk=30000)+lz4_legacy(a2))
 open(f'{d}/ramdisk.cpio','wb').write(a2)
 sb=bytearray(4096); sb[1024:1028]=struct.pack('<I',0xF2F52010); open(f'{d}/fs_f2fs.raw','wb').write(sb)
 sb=bytearray(4096); sb[1024+56:1024+58]=b'\x53\xEF'; open(f'{d}/fs_ext4.raw','wb').write(sb)
+
+# .xapk bundle: stored and deflated entries, incl. data longer than the 32 KiB deflate window
+import zipfile
+zb=rnd(5000); zt=(b'The quick brown fox jumps over the lazy dog. '*4000)+b'end'
+zm=b''.join((rnd(700)+bytes([i%251])*900+b'aetheron'*60) for i in range(90)); zr=rnd(70000)
+for n,v in [('zip_base',zb),('zip_text',zt),('zip_mixed',zm),('zip_random',zr)]: open(f'{d}/{n}','wb').write(v)
+with zipfile.ZipFile(f'{d}/bundle.xapk','w') as z:
+    z.writestr(zipfile.ZipInfo('base.apk'),zb,zipfile.ZIP_STORED)
+    z.writestr(zipfile.ZipInfo('config.x86_64.apk'),zt,zipfile.ZIP_DEFLATED)
+    z.writestr(zipfile.ZipInfo('config.arm64_v8a.apk'),zm,zipfile.ZIP_DEFLATED)
+    z.writestr(zipfile.ZipInfo('Android/obb/com.example.game/main.1.com.example.game.obb'),zr,zipfile.ZIP_DEFLATED)
+    z.writestr(zipfile.ZipInfo('empty.apk'),b'',zipfile.ZIP_DEFLATED)
+    z.writestr(zipfile.ZipInfo('manifest.json'),b'{}',zipfile.ZIP_STORED)
+b=bytearray(open(f'{d}/bundle.xapk','rb').read()); p=b.find(b'config.x86_64.apk')+len('config.x86_64.apk')+40; b[p]^=0x55
+open(f'{d}/bundle_bad.xapk','wb').write(b)
