@@ -69,8 +69,10 @@ constexpr uint8_t kSlotNet = 9;   // shares an interrupt line with slot 1 (PCI I
 constexpr uint8_t kSlotVsock = 10;
 constexpr uint8_t kSlotHvc4 = 11;  // hvc4..hvc19 in slots 11..26 (the guest numbers consoles in slot order)
 constexpr UINT WM_APP_CLOSE_NOW = WM_APP + 2;
+constexpr UINT WM_APP_LAYOUT = WM_APP + 3;
 constexpr wchar_t kWipeMarker[] = L"\\wipe_data_on_next_start";
-constexpr UINT kCmdCollectLogs = 101, kCmdShowConsole = 102, kCmdOpenFolder = 103, kCmdExit = 104, kCmdWipe = 105;
+constexpr UINT kCmdCollectLogs = 101, kCmdShowConsole = 102, kCmdOpenFolder = 103, kCmdExit = 104, kCmdWipe = 105,
+               kCmdSkipSplash = 106;
 uint8_t SlotForHvc(int i) { return uint8_t(i < 4 ? kSlotHvc0 + i : kSlotHvc4 + (i - 4)); }
 uint32_t GsiForSlot(uint8_t slot) {
     if (slot < kSlotHvc4) return 16 + (slot - 1) % 8;
@@ -90,6 +92,9 @@ struct Settings {
     uint32_t cpus = 1;
     uint32_t width = 720, height = 1280;
     bool network = true;
+    bool boot_splash = true;
+    bool first_boot_setup = true;
+    std::wstring setup_script = L"config\\aetheron_setup.sh";
     std::string cmdline_extra = "console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 8250.nr_uarts=1";
 };
 
@@ -112,6 +117,9 @@ struct App {
     std::thread shutdown_thread;
     std::atomic<bool> shutting_down{false};
     std::atomic<bool> closing{false};
+    HWND view = nullptr;  // child window showing the guest screen at its aspect ratio
+    uint32_t view_w = 0, view_h = 0;
+    std::atomic<bool> reveal{false};
     SerialConsole console;
     std::unique_ptr<BootStageTracker> stage;
     ScanoutBuffer scanout;
@@ -139,8 +147,17 @@ std::wstring Resolve(const std::wstring& base, const std::wstring& p) {
     return base + L"\\" + p;
 }
 
+void UpdateSplash(const std::string& status) {
+    const int rank = g.stage ? g.stage->rank() : 0;
+    const bool show = g.s.boot_splash && !g.reveal && rank < BootStageTracker::kRankBootCompleted;
+    const std::string prefix = "guest running: ";
+    const std::string text = status.rfind(prefix, 0) == 0 ? status.substr(prefix.size()) : status;
+    g.display.SetSplash(show, rank * 100 / BootStageTracker::kRankBootCompleted, Widen(text));
+}
+
 void SetStatus(const std::string& text) {
     Log("status: %s", text.c_str());
+    UpdateSplash(text);
     if (g.hwnd) PostMessageW(g.hwnd, WM_APP_STATUS, 0, LPARAM(new std::wstring(Widen(text))));
 }
 
@@ -187,10 +204,14 @@ void LoadSettings() {
         else if (k == "display_height") g.s.height = std::stoul(v);
         else if (k == "cmdline_extra") g.s.cmdline_extra = v;
         else if (k == "network") g.s.network = (v == "on" || v == "1" || v == "true");
+        else if (k == "boot_splash") g.s.boot_splash = (v == "on" || v == "1" || v == "true");
+        else if (k == "first_boot_setup") g.s.first_boot_setup = (v == "on" || v == "1" || v == "true");
+        else if (k == "setup_script") g.s.setup_script = Widen(v);
     }
     g.s.images_dir = Resolve(g.s.base_dir, g.s.images_dir);
     g.s.disk_config = Resolve(g.s.base_dir, g.s.disk_config);
     g.s.bootconfig_file = Resolve(g.s.base_dir, g.s.bootconfig_file);
+    g.s.setup_script = Resolve(g.s.base_dir, g.s.setup_script);
     g.s.cache_dir = g.s.cache_dir.empty() ? g.s.images_dir + L"\\aetheron_cache" : Resolve(g.s.base_dir, g.s.cache_dir);
     if (g.s.cpus != 1) {
         // Application processors need INIT/SIPI start-up handling that this
@@ -221,11 +242,50 @@ void ParseBootconfig(const std::string& text, std::vector<std::pair<std::string,
     }
 }
 
+// Types config\aetheron_setup.sh into Android's console shell once Android
+// has booted. A marker file in the guest (named after the script's contents)
+// makes it run only once per script version.
+void RunGuestSetup() {
+    std::string text;
+    if (!ReadTextFile(g.s.setup_script, &text)) {
+        Log("setup: %ls not found, skipping", g.s.setup_script.c_str());
+        return;
+    }
+    std::vector<std::string> lines;
+    uint32_t hash = 2166136261u;
+    std::istringstream ss(text);
+    std::string line;
+    while (std::getline(ss, line)) {
+        line = Trim(line);
+        if (line.empty() || line[0] == '#') continue;
+        for (char c : line) hash = (hash ^ uint8_t(c)) * 16777619u;
+        lines.push_back(line);
+    }
+    if (lines.empty()) return;
+    for (int i = 0; i < 80 && !g.quit; ++i) Sleep(100);  // let the launcher settle first
+    char marker[64];
+    snprintf(marker, sizeof(marker), "/data/local/tmp/.aetheron_setup_%08x", hash);
+    lines.insert(lines.begin(), std::string("if [ ! -e ") + marker + " ]; then");
+    lines.push_back(std::string("touch ") + marker + "; echo aetheron-setup-done");
+    lines.push_back("fi");
+    Log("setup: sending %zu lines to the Android console (runs once; marker %s)", lines.size(), marker);
+    for (const std::string& l : lines) {
+        if (g.quit || g.shutting_down) return;
+        const std::string out = l + "\n";
+        g.uart->InjectInput(out.data(), out.size());
+        Sleep(40);
+    }
+}
+
 void TimerThread() {
     HANDLE t = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!t) t = CreateWaitableTimerW(nullptr, TRUE, nullptr);
-    bool halt_seen = false;
+    bool halt_seen = false, setup_sent = false;
     while (!g.quit) {
+        if (!setup_sent && g.stage->rank() >= BootStageTracker::kRankBootCompleted) {
+            setup_sent = true;
+            if (g.s.first_boot_setup) std::thread(RunGuestSetup).detach();
+        }
         if (!halt_seen && g.stage->halted()) {
             halt_seen = true;
             g.vm.RequestStop("Android powered off");
@@ -554,6 +614,23 @@ void RequestWipe(HWND hwnd) {
                 L"Aetheron", MB_OK | MB_ICONINFORMATION);
 }
 
+// Keeps the guest screen centred at the guest's aspect ratio (black bars
+// around it) instead of stretching it over the whole window.
+void LayoutView() {
+    if (!g.view || !g.hwnd) return;
+    RECT rc;
+    GetClientRect(g.hwnd, &rc);
+    const int64_t gw = g.view_w ? g.view_w : g.s.width, gh = g.view_h ? g.view_h : g.s.height;
+    const int cw = rc.right, ch = rc.bottom;
+    if (cw <= 0 || ch <= 0 || gw <= 0 || gh <= 0) return;
+    int w = cw, h = int(cw * gh / gw);
+    if (h > ch) {
+        h = ch;
+        w = int(ch * gw / gh);
+    }
+    MoveWindow(g.view, (cw - w) / 2, (ch - h) / 2, w, h, TRUE);
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_APP_STATUS: {
@@ -562,7 +639,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             delete s;
             return 0;
         }
+        case WM_SIZE:
+            if (hwnd == g.hwnd) LayoutView();
+            break;
+        case WM_APP_LAYOUT:
+            g.view_w = uint32_t(wp);
+            g.view_h = uint32_t(lp);
+            LayoutView();
+            return 0;
         case WM_LBUTTONDOWN:
+            if (hwnd != g.view) return 0;  // the bars around the screen are not part of it
             SetCapture(hwnd);
             g.touching = true;
             SendTouch(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), true, true);
@@ -598,6 +684,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     ShellExecuteW(hwnd, L"open", g.s.base_dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                     return 0;
                 case kCmdWipe: RequestWipe(hwnd); return 0;
+                case kCmdSkipSplash:
+                    g.reveal = true;
+                    UpdateSplash("");
+                    return 0;
                 case kCmdExit: SendMessageW(hwnd, WM_CLOSE, 0, 0); return 0;
             }
             break;
@@ -616,6 +706,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g.closing = true;
             PostQuitMessage(0);
             return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// The guest screen: touches go to the shared handler, the keyboard stays with the main window.
+LRESULT CALLBACK ViewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_LBUTTONDOWN:
+            SetFocus(GetParent(hwnd));
+            return WndProc(hwnd, msg, wp, lp);
+        case WM_MOUSEMOVE:
+        case WM_LBUTTONUP:
+            return WndProc(hwnd, msg, wp, lp);
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -653,6 +756,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     AppendMenuW(logs, MF_STRING, kCmdShowConsole, L"Show serial &console");
     AppendMenuW(logs, MF_STRING, kCmdCollectLogs, L"&Collect logs (zip)");
     AppendMenuW(logs, MF_STRING, kCmdOpenFolder, L"&Open Aetheron folder");
+    AppendMenuW(logs, MF_STRING, kCmdSkipSplash, L"Show &Android screen now (skip boot screen)");
     AppendMenuW(logs, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(logs, MF_STRING, kCmdWipe, L"&Factory reset (erase Android data)...");
     AppendMenuW(logs, MF_SEPARATOR, 0, nullptr);
@@ -660,7 +764,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     AppendMenuW(menu, MF_POPUP, UINT_PTR(logs), L"&Aetheron");
     RECT r2 = r;
     AdjustWindowRect(&r2, WS_OVERLAPPEDWINDOW, TRUE);
-    g.hwnd = CreateWindowExW(0, wc.lpszClassName, L"Aetheron - starting", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+    g.hwnd = CreateWindowExW(0, wc.lpszClassName, L"Aetheron - starting", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT,
                              CW_USEDEFAULT, r2.right - r2.left, r2.bottom - r2.top, nullptr, menu, inst, nullptr);
     if (!g.hwnd) return 1;
     ShowWindow(g.hwnd, SW_SHOW);
@@ -670,7 +774,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g.console.Show();
 
     std::string err;
-    if (!g.display.Initialize(g.hwnd, g.s.width, g.s.height, &err)) {
+    WNDCLASSW vc = {};
+    vc.lpfnWndProc = ViewProc;
+    vc.hInstance = inst;
+    vc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    vc.lpszClassName = L"AetheronView";
+    RegisterClassW(&vc);
+    g.view = CreateWindowExW(0, vc.lpszClassName, L"", WS_CHILD | WS_VISIBLE, 0, 0, 16, 16, g.hwnd, nullptr, inst, nullptr);
+    if (!g.view) return 1;
+    LayoutView();
+    g.display.SetLayoutNotify(g.hwnd, WM_APP_LAYOUT);
+    UpdateSplash("starting");
+    if (!g.display.Initialize(g.view, g.s.width, g.s.height, &err)) {
         Log("display: %s", err.c_str());
         MessageBoxA(g.hwnd, ("Direct3D 12 initialisation failed: " + err).c_str(), "Aetheron", MB_OK | MB_ICONERROR);
         return 1;

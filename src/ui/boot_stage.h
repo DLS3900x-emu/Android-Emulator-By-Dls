@@ -13,6 +13,7 @@ class BootStageTracker {
 public:
     enum Channel { kSerial = 0, kLogcat = 1 };
     static constexpr int kRankSecondStage = 4;
+    static constexpr int kRankBootCompleted = 7;
 
     explicit BootStageTracker(std::function<void(const std::string&)> on_stage) : on_stage_(std::move(on_stage)) {}
 

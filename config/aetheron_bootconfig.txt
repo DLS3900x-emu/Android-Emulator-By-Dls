@@ -44,7 +44,9 @@ androidboot.vsock_lights_port = 6900
 # Values Cuttlefish's launcher normally passes (bootconfig_args.cpp).
 androidboot.serialconsole = 1
 androidboot.setupwizard_mode = DISABLED
-androidboot.enable_bootanimation = 1
+# Aetheron draws its own boot screen until Android is ready, so the guest does
+# not spend CPU on an animation nobody sees. Set to 1 if boot_splash = off.
+androidboot.enable_bootanimation = 0
 androidboot.enable_confirmationui = 0
 androidboot.hypervisor.vm.supported = 0
 androidboot.hypervisor.protected_vm.supported = 0

@@ -100,7 +100,83 @@ bool Dx12Display::ResizeTo(uint32_t w, uint32_t h) {
         upload_->Unmap(0, nullptr);
     }
     Log("display: swap chain %ux%u", w, h);
+    if (notify_hwnd_) PostMessageW(notify_hwnd_, notify_msg_, w, h);
     return true;
+}
+
+void Dx12Display::SetSplash(bool show, int percent, const std::wstring& text) {
+    std::lock_guard<std::mutex> lock(splash_mutex_);
+    if (show == splash_on_ && percent == splash_percent_ && text == splash_text_) return;
+    splash_text_ = text;
+    splash_percent_ = percent < 0 ? 0 : percent > 100 ? 100 : percent;
+    splash_on_ = show;
+    ++splash_version_;
+}
+
+// Renders the boot screen with GDI into the upload buffer (BGRA rows).
+void Dx12Display::DrawSplash(uint8_t* dst) {
+    std::wstring text;
+    int percent;
+    {
+        std::lock_guard<std::mutex> lock(splash_mutex_);
+        text = splash_text_;
+        percent = splash_percent_;
+    }
+    const int w = int(width_), h = int(height_);
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;  // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bmp = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+    if (!bmp) {
+        if (dc) DeleteDC(dc);
+        std::memset(dst, 0, size_t(pitch_) * height_);
+        return;
+    }
+    HGDIOBJ old_bmp = SelectObject(dc, bmp);
+    auto fill = [&](int x, int y, int cx, int cy, COLORREF c) {
+        RECT r = {x, y, x + cx, y + cy};
+        HBRUSH b = CreateSolidBrush(c);
+        FillRect(dc, &r, b);
+        DeleteObject(b);
+    };
+    auto font = [&](int px, int weight) {
+        return CreateFontW(-px, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    };
+    fill(0, 0, w, h, RGB(11, 13, 18));
+    SetBkMode(dc, TRANSPARENT);
+
+    HFONT title = font(h / 18, FW_LIGHT);
+    HGDIOBJ old_font = SelectObject(dc, title);
+    SetTextColor(dc, RGB(240, 243, 250));
+    RECT tr = {0, h * 38 / 100, w, h * 50 / 100};
+    DrawTextW(dc, L"A E T H E R O N", -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    const int bw = w * 46 / 100, bh = h / 320 > 3 ? h / 320 : 3, bx = (w - bw) / 2, by = h * 55 / 100;
+    fill(bx, by, bw, bh, RGB(38, 42, 52));
+    fill(bx, by, bw * percent / 100, bh, RGB(120, 170, 255));
+
+    HFONT small = font(h / 56, FW_NORMAL);
+    SelectObject(dc, small);
+    SetTextColor(dc, RGB(140, 148, 165));
+    RECT sr = {w / 12, by + bh + h / 50, w - w / 12, by + bh + h / 50 + h / 8};
+    DrawTextW(dc, text.c_str(), -1, &sr, DT_CENTER | DT_WORDBREAK);
+
+    GdiFlush();
+    for (int y = 0; y < h; ++y)
+        std::memcpy(dst + size_t(y) * pitch_, static_cast<const uint8_t*>(bits) + size_t(y) * w * 4, size_t(w) * 4);
+    SelectObject(dc, old_font);
+    SelectObject(dc, old_bmp);
+    DeleteObject(title);
+    DeleteObject(small);
+    DeleteObject(bmp);
+    DeleteDC(dc);
 }
 
 void Dx12Display::Start(ScanoutBuffer* scanout) {
@@ -128,13 +204,17 @@ bool Dx12Display::PresentFrame() {
             if (!ResizeTo(scanout_->width, scanout_->height)) return false;
             last_frame_ = ~0ULL;
         }
-        uint64_t frame = scanout_->frame.load();
+        const bool splash = splash_on_;
+        // The top bit keeps boot-screen versions distinct from guest frame numbers.
+        const uint64_t frame = splash ? (0x8000000000000000ULL | splash_version_.load()) : scanout_->frame.load();
         if (frame != last_frame_) {
             void* p = nullptr;
             D3D12_RANGE none = {0, 0};
             if (FAILED(upload_->Map(0, &none, &p))) return false;
             uint8_t* dst = static_cast<uint8_t*>(p);
-            if (scanout_->enabled && scanout_->width == width_ && scanout_->height == height_) {
+            if (splash) {
+                DrawSplash(dst);
+            } else if (scanout_->enabled && scanout_->width == width_ && scanout_->height == height_) {
                 for (uint32_t y = 0; y < height_; ++y)
                     std::memcpy(dst + size_t(y) * pitch_, scanout_->bgra.data() + size_t(y) * width_, width_ * 4);
             } else {

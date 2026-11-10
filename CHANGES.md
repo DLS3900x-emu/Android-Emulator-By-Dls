@@ -1,3 +1,22 @@
+# v5
+
+- **Screen is no longer stretched.** The Android screen keeps its aspect
+  ratio and is centred with black bars when the window is wide or maximised;
+  touches still land where you click.
+- **Clean boot screen**: Aetheron logo, progress bar and the real boot stage
+  until Android is ready (`boot_splash` in `aetheron.ini`; *Aetheron menu →
+  Show Android screen now* skips it). Android's own boot animation is turned
+  off, which also saves CPU during boot.
+- **Clean home screen**: after the first boot, `config\aetheron_setup.sh` is
+  typed into Android's console once. It switches off every app with an icon
+  except Settings, the Play Store and the file picker, enables the dark
+  theme, shortens animations and removes the lock screen. Edit the file to
+  change what stays (`first_boot_setup` in `aetheron.ini` turns it off).
+
+Not tested on Windows: the boot screen drawing and the setup script. The
+Play Store is **not** part of AOSP Cuttlefish images; it only appears if the
+Android image itself contains Google apps.
+
 # v4
 
 Fixes the boot hang seen in the v3 logs: `system_server` waited forever for
