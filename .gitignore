@@ -1,0 +1,10 @@
+*.log
+aetheron_logs_*
+wipe_data_on_next_start
+build/
+.hoplite/
+tests/linux_harness/imgs/
+tests/linux_harness/test
+tests/linux_harness/nettest
+tests/linux_harness/disk.bin
+tests/linux_harness/payload.bin

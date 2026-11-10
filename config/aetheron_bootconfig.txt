@@ -1,0 +1,60 @@
+# Extra Android bootconfig values (androidboot.*), merged over the ones in
+# vendor_boot.img. On a real device the bootloader supplies these; on
+# Cuttlefish the launcher (assemble_cvd) does. Values below follow Cuttlefish's
+# guest-only configuration (no host-side daemons). Verify them against
+# device/google/cuttlefish/host/commands/assemble_cvd/bootconfig_args.cpp
+# for your exact build if something does not start.
+#
+# androidboot.boot_devices is generated automatically from the virtual disk's
+# PCI address; you can override it here.
+
+androidboot.hardware = cutf_cvm
+androidboot.slot_suffix = _a
+androidboot.force_normal_boot = 1
+androidboot.serialno = AETHERON00001
+androidboot.verifiedbootstate = orange
+androidboot.vbmeta.device_state = unlocked
+androidboot.selinux = permissive
+androidboot.console = ttyS0
+androidboot.lcd_density = 320
+
+# Which /fstab.<suffix> first-stage init uses. Normally detected automatically
+# from the vendor ramdisk and the userdata filesystem; uncomment to force.
+# androidboot.fstab_suffix = cf.f2fs.hctr2
+
+# Graphics: guest-side software rendering (SwiftShader/ANGLE) over virtio-gpu 2D.
+androidboot.hardware.gralloc = minigbm
+# Cuttlefish ships two composer APEXes; this picks one (multi-install APEX).
+androidboot.vendor.apex.com.android.hardware.graphics.composer = com.android.hardware.graphics.composer.ranchu
+androidboot.hardware.hwcomposer = ranchu
+androidboot.hardware.hwcomposer.mode = client
+androidboot.hardware.hwcomposer.display_finder_mode = drm
+androidboot.hardware.egl = angle
+androidboot.hardware.vulkan = pastel
+androidboot.opengles.version = 196609
+
+# Security HALs implemented entirely inside the guest (no host secure_env).
+androidboot.vendor.apex.com.android.hardware.keymint = com.android.hardware.keymint.rust_nonsecure
+androidboot.vendor.apex.com.android.hardware.gatekeeper = com.android.hardware.gatekeeper.nonsecure
+
+# Cuttlefish HALs that talk to the host over vsock read their port from these.
+# Aetheron's vsock host side accepts any port (see trace.log "vsock:" lines).
+androidboot.vsock_lights_port = 6900
+
+# Values Cuttlefish's launcher normally passes (bootconfig_args.cpp).
+androidboot.serialconsole = 1
+androidboot.setupwizard_mode = DISABLED
+androidboot.enable_bootanimation = 1
+androidboot.enable_confirmationui = 0
+androidboot.hypervisor.vm.supported = 0
+androidboot.hypervisor.protected_vm.supported = 0
+androidboot.wifi_mac_prefix = 5554
+androidboot.wifi_impl = virt_wifi
+androidboot.cuttlefish_service_bluetooth_checker = false
+# The Thread HAL aborts ("node_id > 0") without a node id.
+androidboot.openthread_node_id = 1
+# No sound card yet: let the audio HAL run without one.
+androidboot.audio.tinyalsa.ignore_output = true
+androidboot.audio.tinyalsa.simulate_input = true
+# Software rendering on one vCPU is slow; relax HAL/watchdog timeouts.
+androidboot.hw_timeout_multiplier = 10
