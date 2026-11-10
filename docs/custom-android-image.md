@@ -87,8 +87,9 @@ services to device makers (BlueStacks has such an agreement); they are not
 open source and Aetheron does not include them.
 
 - For a product you distribute, you need that licence from Google.
-- Without Google apps, open-source stores work on a plain image: install
-  their `.apk` with Aetheron's *Install an app* button.
+- Without Google apps, open-source stores work on a plain image: build
+  their `.apk` into your image, or install it over adb (`adb_bridge = on` in
+  `aetheron.ini`, then `adb connect 127.0.0.1:6520`).
 - Community "GApps" packages can be built into a private image, but Google
   then treats the device as uncertified and Play may refuse to sign in until
   the device is registered. That is between you and Google's terms.
