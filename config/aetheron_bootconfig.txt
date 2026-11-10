@@ -16,7 +16,8 @@ androidboot.verifiedbootstate = orange
 androidboot.vbmeta.device_state = unlocked
 androidboot.selinux = permissive
 androidboot.console = ttyS0
-androidboot.lcd_density = 320
+# 1280x720 at 160 dpi gives Android its tablet (landscape) layout, like BlueStacks.
+androidboot.lcd_density = 160
 
 # Which /fstab.<suffix> first-stage init uses. Normally detected automatically
 # from the vendor ramdisk and the userdata filesystem; uncomment to force.

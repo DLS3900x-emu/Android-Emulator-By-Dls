@@ -90,7 +90,7 @@ struct Settings {
     std::wstring bootconfig_file = L"config\\aetheron_bootconfig.txt";
     uint64_t ram_mb = 4096;
     uint32_t cpus = 1;
-    uint32_t width = 720, height = 1280;
+    uint32_t width = 1280, height = 720;
     bool network = true;
     bool boot_splash = true;
     bool first_boot_setup = true;
@@ -749,6 +749,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     RECT work;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     double scale = 0.85 * (work.bottom - work.top) / g.s.height;
+    const double fit_w = 0.92 * (work.right - work.left) / g.s.width;
+    if (fit_w < scale) scale = fit_w;
     if (scale > 1.0) scale = 1.0;
     RECT r = {0, 0, LONG(g.s.width * scale), LONG(g.s.height * scale)};
     HMENU menu = CreateMenu();
